@@ -1,0 +1,7 @@
+---
+# Ansible Galaxy requirements for the SSH Key Rotation collection
+# Install with: ansible-galaxy install -r requirements.yml
+
+collections:
+  - name: ansible.posix
+    version: ">=1.3.0"
