@@ -1,0 +1,7 @@
+---
+
+- name: Reload sshd
+  ansible.builtin.service:
+    name: "{{ ssh_key_rotation_sshd_service }}"
+    state: reloaded
+  become: true

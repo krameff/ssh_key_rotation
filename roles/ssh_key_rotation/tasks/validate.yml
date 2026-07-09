@@ -1,0 +1,134 @@
+---
+
+- name: Validate | Assert required variables are provided
+  ansible.builtin.assert:
+    that:
+      - old_private_key is defined and old_private_key | length > 0
+      - new_private_key is defined and new_private_key | length > 0
+      - old_public_key_file is defined and old_public_key_file | length > 0
+      - new_public_key_file is defined and new_public_key_file | length > 0
+    fail_msg: >-
+      Missing required variables. Pass all of: old_private_key, new_private_key,
+      old_public_key_file, new_public_key_file (see README.md for an example).
+
+- name: Validate | Inspect the new public key (type, size, fingerprint)
+  ansible.builtin.command: "ssh-keygen -lf {{ new_public_key_file }}"
+  changed_when: false
+  register: ssh_key_rotation_new_key_info
+
+- name: Validate | Parse the new key's type, bit size, and fingerprint
+  ansible.builtin.set_fact:
+    ssh_key_rotation_new_key_type: "{{ ssh_key_rotation_new_key_info.stdout | regex_search('\\(([^)]+)\\)\\s*$') | regex_replace('[()]', '') }}"
+    ssh_key_rotation_new_key_bits: "{{ ssh_key_rotation_new_key_info.stdout.split(' ')[0] }}"
+    ssh_key_rotation_new_key_fingerprint: "{{ ssh_key_rotation_new_key_info.stdout.split(' ')[1] }}"
+
+- name: Validate | Reject known-weak or deprecated key types
+  ansible.builtin.assert:
+    that: ssh_key_rotation_new_key_type not in ssh_key_rotation_reject_key_types
+    fail_msg: >-
+      new_public_key_file is a {{ ssh_key_rotation_new_key_type }} key, which is in
+      ssh_key_rotation_reject_key_types ({{ ssh_key_rotation_reject_key_types }}).
+      Generate a stronger key (see QUICKSTART.md).
+
+- name: Validate | Require the new key type to be an accepted classical or recognized PQC type
+  ansible.builtin.assert:
+    that: ssh_key_rotation_new_key_type in (ssh_key_rotation_accepted_key_types + ssh_key_rotation_pqc_key_types)
+    fail_msg: >-
+      new_public_key_file has type {{ ssh_key_rotation_new_key_type }}, which is not in
+      ssh_key_rotation_accepted_key_types or ssh_key_rotation_pqc_key_types. Update those
+      lists in roles/ssh_key_rotation/defaults/main.yml if this type should be allowed.
+    success_msg: "New key type {{ ssh_key_rotation_new_key_type }} is recognized."
+
+- name: Validate | Enforce minimum RSA key size
+  when: ssh_key_rotation_new_key_type == 'RSA'
+  ansible.builtin.assert:
+    that: ssh_key_rotation_new_key_bits | int >= ssh_key_rotation_min_rsa_bits | int
+    fail_msg: >-
+      new_public_key_file is a {{ ssh_key_rotation_new_key_bits }}-bit RSA key; minimum
+      accepted is {{ ssh_key_rotation_min_rsa_bits }} bits.
+
+- name: Validate | Derive the public key from the new private key
+  ansible.builtin.shell: |
+    set -o pipefail 
+    ssh-keygen -y -f {{ new_private_key }} | ssh-keygen -lf -
+  args:
+    executable: "{{ os_default_shell }}"
+  changed_when: false
+  register: ssh_key_rotation_new_key_from_private
+
+- name: Validate | Confirm new_private_key and new_public_key_file are a matching pair
+  ansible.builtin.assert:
+    that: ssh_key_rotation_new_key_from_private.stdout.split(' ')[1] == ssh_key_rotation_new_key_fingerprint
+    fail_msg: >-
+      new_private_key does not match new_public_key_file (fingerprints differ).
+      Double-check both paths before rotating any hosts.
+    success_msg: "new_private_key and new_public_key_file are a matching pair."
+
+# Confirms the CONTROL NODE's own ssh binary supports these algorithms; the target's sshd support is checked in the install stage.
+- name: Validate | Query the control node's supported KEX algorithms
+  when: ssh_key_rotation_pqc_kex_algorithms | length > 0
+  ansible.builtin.command: ssh -Q kex
+  changed_when: false
+  failed_when: false
+  register: ssh_key_rotation_local_kex_support
+
+- name: Validate | Assert the control node's ssh client supports the requested PQC KEX algorithms
+  when:
+    - ssh_key_rotation_pqc_kex_algorithms | length > 0
+    - ssh_key_rotation_local_kex_support.rc == 0
+  ansible.builtin.assert:
+    that: ssh_key_rotation_pqc_kex_algorithms | difference(ssh_key_rotation_local_kex_support.stdout_lines) | length == 0
+    fail_msg: >-
+      The control node's ssh client does not advertise
+      {{ ssh_key_rotation_pqc_kex_algorithms | difference(ssh_key_rotation_local_kex_support.stdout_lines) }}
+      (from `ssh -Q kex`). Install/build an OpenSSH that supports these algorithms before rotating any host.
+    success_msg: "Control node ssh client supports all requested ssh_key_rotation_pqc_kex_algorithms."
+
+- name: Validate | Warn if the control node's ssh client doesn't support `ssh -Q kex`
+  when:
+    - ssh_key_rotation_pqc_kex_algorithms | length > 0
+    - ssh_key_rotation_local_kex_support.rc != 0
+  ansible.builtin.debug:
+    msg: >-
+      `ssh -Q kex` failed locally; unable to confirm ssh_key_rotation_pqc_kex_algorithms
+      support on the control node. Proceeding, but KexAlgorithms negotiation may fail later.
+
+- name: Validate | Query the control node's supported public key signature algorithms
+  when: ssh_key_rotation_pqc_pubkey_algorithms | length > 0
+  ansible.builtin.command: ssh -Q key-sig
+  changed_when: false
+  failed_when: false
+  register: ssh_key_rotation_local_keysig_support
+
+- name: Validate | Assert the control node's ssh client supports the requested PQC signature algorithms
+  when:
+    - ssh_key_rotation_pqc_pubkey_algorithms | length > 0
+    - ssh_key_rotation_local_keysig_support.rc == 0
+  ansible.builtin.assert:
+    that: ssh_key_rotation_pqc_pubkey_algorithms | difference(ssh_key_rotation_local_keysig_support.stdout_lines) | length == 0
+    fail_msg: >-
+      The control node's ssh client does not advertise
+      {{ ssh_key_rotation_pqc_pubkey_algorithms | difference(ssh_key_rotation_local_keysig_support.stdout_lines) }}
+      (from `ssh -Q key-sig`). Install/build an OpenSSH (or OQS-OpenSSH) that supports these algorithms.
+    success_msg: "Control node ssh client supports all requested ssh_key_rotation_pqc_pubkey_algorithms."
+
+- name: Validate | Warn if the control node's ssh client doesn't support `ssh -Q key-sig`
+  when:
+    - ssh_key_rotation_pqc_pubkey_algorithms | length > 0
+    - ssh_key_rotation_local_keysig_support.rc != 0
+  ansible.builtin.debug:
+    msg: >-
+      `ssh -Q key-sig` failed locally (older OpenSSH versions lack it); unable to confirm
+      ssh_key_rotation_pqc_pubkey_algorithms support on the control node. Proceeding, but
+      PubkeyAcceptedAlgorithms negotiation may fail later.
+
+# Opt-in control-node crypto-policy management, detected via the tool rather than an OS-family fact (gather_facts is false for this stage).
+# Shared with install.yml's target-host equivalent; see tasks/manage_crypto_policy.yml.
+- name: Validate | Manage the control node's system-wide crypto policy
+  ansible.builtin.include_tasks: manage_crypto_policy.yml
+  vars:
+    ssh_key_rotation_crypto_policy_context: "the control node"
+    ssh_key_rotation_crypto_policy_no_tool_followup: >-
+      Skipping control-node policy management; the pqc_*_algorithms vars will still be
+      injected per-connection via ansible_ssh_extra_args in later stages.
+    ssh_key_rotation_crypto_policy_notify_reload: false

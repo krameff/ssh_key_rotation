@@ -1,0 +1,8 @@
+---
+
+- name: Main | Fail fast if this role was included without an explicit stage
+  ansible.builtin.fail:
+    msg: >-
+      ssh_key_rotation has no default tasks/main.yml entry point. Include it with an
+      explicit stage instead, e.g. `tasks_from: validate`, `install`, or `verify`
+      (see playbooks/rotate.yml).

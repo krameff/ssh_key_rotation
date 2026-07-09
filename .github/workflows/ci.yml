@@ -22,7 +22,7 @@ jobs:
       - name: Install Ansible and ansible-lint
         run: |
           python -m pip install --upgrade pip
-          pip install "ansible>=2.10" ansible-lint
+          pip install "ansible>=2.18" ansible-lint
 
       - name: Install collection dependencies
         run: ansible-galaxy install -r requirements.yml
@@ -31,4 +31,4 @@ jobs:
         run: ansible-playbook playbooks/rotate.yml --syntax-check
 
       - name: Run ansible-lint
-        run: ansible-lint playbooks/
+        run: ansible-lint

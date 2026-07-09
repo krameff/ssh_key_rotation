@@ -1,0 +1,211 @@
+---
+
+- name: Install | Re-derive the new key's type for the informational sshd check below
+  ansible.builtin.command: "ssh-keygen -lf {{ new_public_key_file }}"
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  register: ssh_key_rotation_new_key_info
+
+- name: Install | Set the new key type fact for this host
+  ansible.builtin.set_fact:
+    ssh_key_rotation_new_key_type: "{{ ssh_key_rotation_new_key_info.stdout | regex_search('\\(([^)]+)\\)\\s*$') | regex_replace('[()]', '') }}"
+
+- name: Install | Check whether authorized_keys already exists
+  ansible.builtin.stat:
+    path: "~{{ ssh_key_rotation_target_user }}/.ssh/authorized_keys"
+  register: ssh_key_rotation_authorized_keys_stat
+
+- name: Install | Back up authorized_keys before modifying it
+  when: ssh_key_rotation_authorized_keys_stat.stat.exists
+  ansible.builtin.copy:
+    src: "~{{ ssh_key_rotation_target_user }}/.ssh/authorized_keys"
+    dest: "~{{ ssh_key_rotation_target_user }}/.ssh/authorized_keys.bak-{{ ansible_date_time.iso8601_basic_short }}"
+    remote_src: true
+    mode: preserve
+
+- name: Install | Install the new (PwC) public key in authorized_keys
+  ansible.posix.authorized_key:
+    user: "{{ ssh_key_rotation_target_user }}"
+    key: "{{ lookup('file', new_public_key_file) }}"
+    state: present
+    exclusive: false          # keep the old key for now - we still need it
+
+- name: Install | Ensure public key authentication is enabled
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^#?\s*PubkeyAuthentication'
+    line: 'PubkeyAuthentication yes'
+    validate: 'sshd -t -f %s'
+    backup: true
+  become: true
+  notify: Reload sshd
+
+- name: Install | Ensure AuthorizedKeysFile points at the default location
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^#?\s*AuthorizedKeysFile'
+    line: 'AuthorizedKeysFile .ssh/authorized_keys'
+    validate: 'sshd -t -f %s'
+    backup: true
+  become: true
+  notify: Reload sshd
+
+# Opt-in, empty by default; the + prefix appends to OpenSSH's compiled-in defaults so non-PQC clients can still fall back.
+- name: Install | Enable PQC/hybrid key exchange algorithms in sshd_config
+  when: ssh_key_rotation_pqc_kex_algorithms | length > 0
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^#?\s*KexAlgorithms'
+    line: 'KexAlgorithms +{{ ssh_key_rotation_pqc_kex_algorithms | join(",") }}'
+    validate: 'sshd -t -f %s'
+    backup: true
+  become: true
+  notify: Reload sshd
+
+- name: Install | Enable PQC/hybrid public key algorithms in sshd_config
+  when: ssh_key_rotation_pqc_pubkey_algorithms | length > 0
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^#?\s*PubkeyAcceptedAlgorithms'
+    line: 'PubkeyAcceptedAlgorithms +{{ ssh_key_rotation_pqc_pubkey_algorithms | join(",") }}'
+    validate: 'sshd -t -f %s'
+    backup: true
+  become: true
+  notify: Reload sshd
+
+# Reuses pqc_pubkey_algorithms for host keys too, since the same signature algorithms usually apply to both user and host keys.
+- name: Install | Enable PQC/hybrid host key algorithms in sshd_config
+  when: ssh_key_rotation_pqc_pubkey_algorithms | length > 0
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^#?\s*HostKeyAlgorithms'
+    line: 'HostKeyAlgorithms +{{ ssh_key_rotation_pqc_pubkey_algorithms | join(",") }}'
+    validate: 'sshd -t -f %s'
+    backup: true
+  become: true
+  notify: Reload sshd
+
+- name: Install | Enable PQC/hybrid CA signature algorithms in sshd_config
+  when: ssh_key_rotation_pqc_ca_signature_algorithms | length > 0
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^#?\s*CASignatureAlgorithms'
+    line: 'CASignatureAlgorithms +{{ ssh_key_rotation_pqc_ca_signature_algorithms | join(",") }}'
+    validate: 'sshd -t -f %s'
+    backup: true
+  become: true
+  notify: Reload sshd
+
+# Same opt-in crypto-policy handling as the validate stage's control-node block, detected via the tool rather than ansible_os_family.
+# Shared with validate.yml's control-node equivalent; see tasks/manage_crypto_policy.yml.
+- name: Install | Manage this host's system-wide crypto policy
+  ansible.builtin.include_tasks: manage_crypto_policy.yml
+  vars:
+    ssh_key_rotation_crypto_policy_context: "this host"
+    ssh_key_rotation_crypto_policy_no_tool_followup: "Falling back to the direct sshd_config algorithm edits above only."
+
+# update-crypto-policies only validates its own syntax, not the merged sshd_config, so re-validate here before the reload handler fires.
+- name: Install | Validate sshd_config after crypto-policy check/apply
+  when:
+    - ssh_key_rotation_manage_crypto_policy | bool
+    - ssh_key_rotation_crypto_policies_tool.rc == 0
+  ansible.builtin.command: sshd -t
+  become: true
+  changed_when: false
+  register: ssh_key_rotation_sshd_validate_after_crypto_policy
+  failed_when: ssh_key_rotation_sshd_validate_after_crypto_policy.rc != 0
+
+# A drop-in (e.g. /etc/ssh/sshd_config.d/50-cloud-init.conf) can override the main file - if your hosts use drop-ins, write these settings there instead.
+- name: Install | Detect any sshd_config drop-in files that could override settings
+  ansible.builtin.find:
+    paths: /etc/ssh/sshd_config.d
+    patterns: '*.conf'
+  become: true
+  register: ssh_key_rotation_sshd_dropins
+  failed_when: false
+
+- name: Install | Warn if drop-in config files are present
+  when: ssh_key_rotation_sshd_dropins.files | default([]) | length > 0
+  ansible.builtin.debug:
+    msg: >-
+      Drop-in sshd config files found: {{ ssh_key_rotation_sshd_dropins.files | map(attribute='path') | list }}.
+      Verify none of them re-enable the settings this playbook is changing.
+      {{ "Note: 50-redhat.conf is the crypto-policy backend include - manage its " ~
+         "algorithm settings via update-crypto-policies/manage_crypto_policy, not by " ~
+         "hand-editing it directly." if ssh_key_rotation_sshd_dropins.files | map(attribute='path')
+            | select('search', '50-redhat.conf') | list | length > 0 else "" }}
+
+# lineinfile only edits the global section; a Match block (e.g. Match User ...) can override these settings and isn't inspected here.
+- name: Install | Detect Match blocks in sshd_config that could override global settings
+  ansible.builtin.command: "grep -n '^[[:space:]]*Match' /etc/ssh/sshd_config"
+  become: true
+  register: ssh_key_rotation_sshd_match_blocks
+  changed_when: false
+  failed_when: false
+
+- name: Install | Warn if Match blocks are present
+  when: ssh_key_rotation_sshd_match_blocks.stdout_lines | default([]) | length > 0
+  ansible.builtin.debug:
+    msg: >-
+      sshd_config contains Match block(s): {{ ssh_key_rotation_sshd_match_blocks.stdout_lines }}.
+      This playbook only edits the global section - settings inside a Match
+      block are NOT modified and could silently override what this playbook sets.
+
+- name: Install | Apply sshd changes now so the new key is usable in the verify stage
+  ansible.builtin.meta: flush_handlers
+
+- name: Install | Check the effective sshd configuration for the new key's algorithm
+  ansible.builtin.command: sshd -T
+  become: true
+  changed_when: false
+  failed_when: false
+  register: ssh_key_rotation_sshd_effective_config
+
+# Extracted as real comma-split lists, not a whole-blob substring search (which false-matched "ed25519" against the unrelated hostkey path line).
+- name: Install | Extract the effective PubkeyAcceptedAlgorithms as a list
+  when: ssh_key_rotation_sshd_effective_config.rc == 0
+  ansible.builtin.set_fact:
+    ssh_key_rotation_effective_pubkey_algorithms: >-
+      {{ (ssh_key_rotation_sshd_effective_config.stdout
+          | regex_search('(?im)^pubkeyacceptedalgorithms\s+(\S+)$', '\1')
+          | default([], true) | first | default('')).split(',') }}
+    ssh_key_rotation_effective_kex_algorithms: >-
+      {{ (ssh_key_rotation_sshd_effective_config.stdout
+          | regex_search('(?im)^kexalgorithms\s+(\S+)$', '\1')
+          | default([], true) | first | default('')).split(',') }}
+
+# Hard failure, not a warning: stops before the verify stage could remove the old key if the target's crypto-policy would reject the new key entirely.
+- name: Install | Fail if the target's sshd will not accept the new key's signature algorithm
+  when: ssh_key_rotation_sshd_effective_config.rc == 0
+  ansible.builtin.assert:
+    that: >-
+      (ssh_key_rotation_key_type_signature_algorithms[ssh_key_rotation_new_key_type] | default([ssh_key_rotation_new_key_type | lower]))
+      | intersect(ssh_key_rotation_effective_pubkey_algorithms) | length > 0
+    fail_msg: >-
+      sshd -T on this host reports PubkeyAcceptedAlgorithms={{ ssh_key_rotation_effective_pubkey_algorithms | join(',') }},
+      which does not include any signature algorithm for a {{ ssh_key_rotation_new_key_type }} key
+      ({{ ssh_key_rotation_key_type_signature_algorithms[ssh_key_rotation_new_key_type] | default([ssh_key_rotation_new_key_type]) | join(',') }}).
+      This host's crypto-policy would reject the new key entirely. Generate a key type this host's
+      PubkeyAcceptedAlgorithms accepts (see README.md's Key Validation section), or adjust
+      pqc_pubkey_algorithms/manage_crypto_policy, before continuing. Aborting now, before
+      the verify stage would remove the old key - nothing has been broken.
+    success_msg: "Target sshd will accept the new {{ ssh_key_rotation_new_key_type }} key's signature algorithm."
+
+- name: Install | Determine which requested PQC algorithms are missing from the effective sshd config
+  when:
+    - ssh_key_rotation_sshd_effective_config.rc == 0
+    - (ssh_key_rotation_pqc_kex_algorithms + ssh_key_rotation_pqc_pubkey_algorithms) | length > 0
+  ansible.builtin.set_fact:
+    ssh_key_rotation_missing_pqc_algorithms: >-
+      {{ (ssh_key_rotation_pqc_kex_algorithms | difference(ssh_key_rotation_effective_kex_algorithms))
+         + (ssh_key_rotation_pqc_pubkey_algorithms | difference(ssh_key_rotation_effective_pubkey_algorithms)) }}
+
+- name: Install | Warn if sshd's effective config doesn't appear to include the requested PQC algorithms
+  when:
+    - ssh_key_rotation_missing_pqc_algorithms is defined
+    - ssh_key_rotation_missing_pqc_algorithms | length > 0
+  ansible.builtin.debug:
+    msg: >-
+      sshd -T on this host does not list: {{ ssh_key_rotation_missing_pqc_algorithms }}.
+      The verify stage may fail to negotiate these; review sshd_config/crypto-policy before proceeding.

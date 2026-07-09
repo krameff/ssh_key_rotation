@@ -1,0 +1,60 @@
+---
+
+# Default shell to be used for shell commands
+# Could be overridden by inventory etc
+os_default_shell: "/bin/bash"
+
+# Key type allowlists; names must match ssh-keygen -l's parenthesized type, e.g. `256 SHA256:... comment (ED25519)`.
+ssh_key_rotation_accepted_key_types:
+  - ED25519
+  - ED25519-SK
+  - ECDSA
+  - ECDSA-SK
+  - RSA
+
+# Forward-compatible slot for future PQC signature key types; see README's Key Validation section.
+ssh_key_rotation_pqc_key_types: []
+ssh_key_rotation_reject_key_types:
+  - DSA
+ssh_key_rotation_min_rsa_bits: 3072
+
+# PQC/crypto-policy negotiation vars, opt-in and empty/false by default. See README's PQC Algorithm Negotiation section.
+ssh_key_rotation_pqc_kex_algorithms: []
+ssh_key_rotation_pqc_pubkey_algorithms: []
+ssh_key_rotation_pqc_ca_signature_algorithms: []
+ssh_key_rotation_manage_crypto_policy: false
+ssh_key_rotation_crypto_policy_setting: "DEFAULT:PQ"
+
+# Preferred over ssh_key_rotation_crypto_policy_setting: adds module(s) (e.g. PQ) on top of whatever a host already
+# has active instead of replacing the whole policy.
+ssh_key_rotation_crypto_policy_add_modules: []
+
+# Maps an ssh-keygen -l key type to its real signature algorithm(s) for PubkeyAcceptedAlgorithms (FIPS drops ssh-ed25519); see README's Key Validation.
+ssh_key_rotation_key_type_signature_algorithms:
+  ED25519: ["ssh-ed25519"]
+  ED25519-SK: ["sk-ssh-ed25519@openssh.com"]
+  ECDSA: ["ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521"]
+  ECDSA-SK: ["sk-ecdsa-sha2-nistp256@openssh.com"]
+  RSA: ["rsa-sha2-256", "rsa-sha2-512", "ssh-rsa"]
+  DSA: ["ssh-dss"]
+
+# Verify/cleanup stage options.
+ssh_key_rotation_disable_password_auth: true   # disable password login = "the old way of connecting"
+ssh_key_rotation_disable_kbd_interactive: true
+ssh_key_rotation_make_exclusive: false         # set true to leave ONLY the new key in authorized_keys
+
+# Common to install/verify stages; same user on both ends of the rotation.
+ssh_key_rotation_target_user: "{{ ansible_user | default(lookup('env', 'USER')) }}"
+
+# Debian/Ubuntu names the service "ssh"; RHEL/Fedora/openSUSE etc. name it "sshd". Computed once here
+# (instead of a repeated set_fact in both install.yml and verify.yml) so there's a single source of
+# truth; both stages gather facts before this is ever read, so ansible_os_family is always available.
+ssh_key_rotation_sshd_service: "{{ 'ssh' if ansible_os_family == 'Debian' else 'sshd' }}"
+
+# Injects PQC algorithms into this role's own ssh connections only; + appends to OpenSSH's defaults so non-PQC
+# fallback still works. Left unprefixed: this is Ansible's own "magic" connection variable, not a role setting.
+ansible_ssh_extra_args: >-  # noqa: var-naming[no-role-prefix]
+  {{ ([
+    ('-o KexAlgorithms=+' + (ssh_key_rotation_pqc_kex_algorithms | join(','))) if ssh_key_rotation_pqc_kex_algorithms | length > 0 else '',
+    ('-o PubkeyAcceptedAlgorithms=+' + (ssh_key_rotation_pqc_pubkey_algorithms | join(','))) if ssh_key_rotation_pqc_pubkey_algorithms | length > 0 else ''
+  ] | select | join(' ')) }}

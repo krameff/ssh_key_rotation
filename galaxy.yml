@@ -4,18 +4,17 @@ name: ssh_key_rotation
 version: 1.0.0
 readme: README.md
 authors:
-  - mark@krameff.com
+  - Krameff Solutions Limited <info@krameff.com>
 description: Safe SSH key rotation for production systems with multi-phase validation
 license:
-  - GPL-3.0-or-later
+  - MIT
 repository: https://github.com/krameff/ssh_key_rotation
 issues: https://github.com/krameff/ssh_key_rotation/issues
 documentation: https://github.com/krameff/ssh_key_rotation
 tags:
   - security
   - ssh
-  - key-management
+  - key_management
   - infrastructure
-requirements:
-  - name: ansible.posix
-    version: ">=1.3.0"
+dependencies:
+  ansible.posix: ">=1.3.0"

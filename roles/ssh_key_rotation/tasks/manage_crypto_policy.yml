@@ -1,0 +1,104 @@
+---
+
+# Shared by validate.yml (control node) and install.yml (target host) via include_tasks, so this
+# RHEL/Fedora-only logic lives in exactly one place instead of two near-identical copies. Gated by
+# detecting the update-crypto-policies tool itself, not an OS-family fact, since that's what
+# actually determines whether any of this applies on a given host.
+#
+# Callers must pass:
+#   ssh_key_rotation_crypto_policy_context           - noun phrase for task names/messages, e.g. "the control node" or "this host"
+#   ssh_key_rotation_crypto_policy_no_tool_followup  - what happens next if the tool is missing (differs by caller)
+# Callers may pass:
+#   ssh_key_rotation_crypto_policy_notify_reload     - notify the "Reload sshd" handler once applied (default true;
+#                                                       validate.yml sets this false, there's no target sshd to reload on the control node)
+- name: "Manage crypto policy | Check whether the crypto-policies tool is present on {{ ssh_key_rotation_crypto_policy_context }}"
+  when: ssh_key_rotation_manage_crypto_policy
+  ansible.builtin.command: command -v update-crypto-policies
+  changed_when: false
+  failed_when: false
+  register: ssh_key_rotation_crypto_policies_tool
+
+- name: "Manage crypto policy | Warn if manage_crypto_policy is set but the crypto-policies tool is missing on {{ ssh_key_rotation_crypto_policy_context }}"
+  when:
+    - ssh_key_rotation_manage_crypto_policy
+    - ssh_key_rotation_crypto_policies_tool.rc != 0
+  ansible.builtin.debug:
+    msg: >-
+      ssh_key_rotation_manage_crypto_policy is true, but update-crypto-policies was not
+      found on {{ ssh_key_rotation_crypto_policy_context }} (it's RHEL/Fedora-only tooling).
+      {{ ssh_key_rotation_crypto_policy_no_tool_followup }}
+
+- name: "Manage crypto policy | Check the current system-wide crypto policy on {{ ssh_key_rotation_crypto_policy_context }}"
+  when:
+    - ssh_key_rotation_manage_crypto_policy
+    - ssh_key_rotation_crypto_policies_tool.rc == 0
+  ansible.builtin.command: update-crypto-policies --show
+  changed_when: false
+  register: ssh_key_rotation_crypto_policy_current
+
+# Merge the desired crypto policy onto this host's CURRENT policy, rather than replacing it outright.
+- name: "Manage crypto policy | Merge the desired crypto policy onto the CURRENT policy on {{ ssh_key_rotation_crypto_policy_context }}"
+  when:
+    - ssh_key_rotation_manage_crypto_policy
+    - ssh_key_rotation_crypto_policies_tool.rc == 0
+    - ssh_key_rotation_crypto_policy_add_modules | length > 0
+  ansible.builtin.set_fact:
+    ssh_key_rotation_crypto_policy_desired: >-
+      {{ (ssh_key_rotation_crypto_policy_current.stdout.split(':')
+          + (ssh_key_rotation_crypto_policy_add_modules | map('upper') | list
+             | difference(ssh_key_rotation_crypto_policy_current.stdout.split(':') | map('upper') | list)))
+         | join(':') }}
+
+- name: "Manage crypto policy | Fall back to crypto_policy_setting as the desired crypto policy for {{ ssh_key_rotation_crypto_policy_context }}"
+  when:
+    - ssh_key_rotation_manage_crypto_policy
+    - ssh_key_rotation_crypto_policies_tool.rc == 0
+    - ssh_key_rotation_crypto_policy_add_modules | length == 0
+  ansible.builtin.set_fact:
+    ssh_key_rotation_crypto_policy_desired: "{{ ssh_key_rotation_crypto_policy_setting }}"
+
+# BASE:MODULE (e.g. FIPS:PQ) needs a MODULE.pmod under /usr/share or /etc crypto-policies modules dirs; see README's crypto-policy section for why.
+- name: "Manage crypto policy | Discover available crypto-policy subpolicy modules on {{ ssh_key_rotation_crypto_policy_context }}"
+  when:
+    - ssh_key_rotation_manage_crypto_policy
+    - ssh_key_rotation_crypto_policies_tool.rc == 0
+    - "':' in ssh_key_rotation_crypto_policy_desired"
+  ansible.builtin.find:
+    paths:
+      - /usr/share/crypto-policies/policies/modules
+      - /etc/crypto-policies/policies/modules
+    patterns: '*.pmod'
+  register: ssh_key_rotation_crypto_policy_modules
+  failed_when: false
+
+- name: "Manage crypto policy | Determine which subpolicy modules the desired crypto policy is missing on {{ ssh_key_rotation_crypto_policy_context }}"
+  when:
+    - ssh_key_rotation_manage_crypto_policy
+    - ssh_key_rotation_crypto_policies_tool.rc == 0
+    - "':' in ssh_key_rotation_crypto_policy_desired"
+  ansible.builtin.set_fact:
+    ssh_key_rotation_missing_crypto_policy_modules: >-
+      {{ (ssh_key_rotation_crypto_policy_desired.split(':')[1:] | map('upper') | list)
+         | difference(ssh_key_rotation_crypto_policy_modules.files | map(attribute='path')
+                       | map('basename') | map('regex_replace', '\.pmod$', '') | map('upper') | list) }}
+
+- name: "Manage crypto policy | Fail if the desired crypto policy references a subpolicy module missing on {{ ssh_key_rotation_crypto_policy_context }}"
+  when: ssh_key_rotation_missing_crypto_policy_modules is defined
+  ansible.builtin.assert:
+    that: ssh_key_rotation_missing_crypto_policy_modules | length == 0
+    fail_msg: >-
+      Desired crypto policy "{{ ssh_key_rotation_crypto_policy_desired }}" needs module(s)
+      {{ ssh_key_rotation_missing_crypto_policy_modules }} that were not found under
+      /usr/share/crypto-policies/policies/modules/ or
+      /etc/crypto-policies/policies/modules/ on {{ ssh_key_rotation_crypto_policy_context }}.
+    success_msg: "All subpolicy modules in the desired crypto policy exist on {{ ssh_key_rotation_crypto_policy_context }}."
+
+- name: "Manage crypto policy | Apply the desired crypto policy on {{ ssh_key_rotation_crypto_policy_context }}"
+  when:
+    - ssh_key_rotation_manage_crypto_policy
+    - ssh_key_rotation_crypto_policies_tool.rc == 0
+    - ssh_key_rotation_crypto_policy_current.stdout != ssh_key_rotation_crypto_policy_desired
+  ansible.builtin.command: "update-crypto-policies --set {{ ssh_key_rotation_crypto_policy_desired }}"
+  become: true
+  changed_when: true
+  notify: "{{ 'Reload sshd' if (ssh_key_rotation_crypto_policy_notify_reload | default(true)) else omit }}"

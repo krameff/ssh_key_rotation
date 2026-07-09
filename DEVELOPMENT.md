@@ -17,14 +17,25 @@ krameff-ssh_key_rotation/
 ├── .github/
 │   └── workflows/
 │       └── ci.yml          # Lint + syntax-check on push/PR
+├── ansible.cfg             # Sets roles_path so playbooks/rotate.yml finds roles/ without installing the collection
 ├── meta/
 │   └── runtime.yml         # Ansible version requirements
 ├── playbooks/
-│   └── rotate.yml          # Main SSH key rotation playbook (Phase 0-2)
-├── plugins/
-│   ├── modules/            # Custom modules (future)
-│   └── filters/            # Custom filters (future)
-└── roles/                  # Reusable roles (future)
+│   └── rotate.yml          # Entry point; runs the ssh_key_rotation role as three plays (validate/install/verify)
+├── roles/
+│   └── ssh_key_rotation/
+│       ├── defaults/main.yml  # All optional variables and their defaults
+│       ├── handlers/main.yml  # Shared "Reload sshd" handler
+│       ├── meta/main.yml      # Role metadata (platforms, min Ansible version)
+│       └── tasks/
+│           ├── main.yml                  # Fails fast - this role has no default entry point, see below
+│           ├── validate.yml              # Phase 0: local pre-flight validation
+│           ├── install.yml               # Phase 1: install the new key, prepare sshd (connect via OLD key)
+│           ├── verify.yml                # Phase 2: verify the new key, then remove the old key/legacy auth
+│           └── manage_crypto_policy.yml  # RHEL/Fedora crypto-policy logic, shared by validate.yml and install.yml via include_tasks
+└── plugins/
+    ├── modules/            # Custom modules (future)
+    └── filters/            # Custom filters (future)
 ```
 
 ## Setup for Development
@@ -32,8 +43,8 @@ krameff-ssh_key_rotation/
 ### Prerequisites
 
 ```bash
-# Ansible 2.10+
-pip install 'ansible>=2.10'
+# Ansible 2.15+
+pip install 'ansible>=2.15'
 
 # ansible.posix collection
 ansible-galaxy collection install ansible.posix
@@ -113,7 +124,8 @@ ansible-playbook -i inventory.ini playbooks/rotate.yml --check
 ### Lint with ansible-lint
 
 ```bash
-ansible-lint playbooks/rotate.yml
+# rotate.yml is just the entry point; lint the whole repo to cover the role too
+ansible-lint
 ```
 
 ### Integration Testing with Molecule (Future)
@@ -199,8 +211,8 @@ This collection follows [Semantic Versioning](https://semver.org/):
 
 1. Run all tests:
    ```bash
-   ansible-lint playbooks/
-   ansible-playbook playbooks/ --syntax-check
+   ansible-lint
+   ansible-playbook playbooks/rotate.yml --syntax-check
    ```
 
 2. Test against multiple OS families (Debian, RHEL)
@@ -225,8 +237,8 @@ This collection follows [Semantic Versioning](https://semver.org/):
 
 See [CHANGELOG.md](CHANGELOG.md) for planned features:
 
-- Basic key type/strength/pairing validation now runs in Phase 0 of `rotate.yml`; a dedicated pre-flight role with richer checks (permissions, passphrase detection) is still future work
-- Per-OS customization role
+- Basic key type/strength/pairing validation now runs in `roles/ssh_key_rotation/tasks/validate.yml`; richer checks (permissions, passphrase detection) are still future work
+- Per-OS customization
 - Key integrity validation module
 - Rollback playbook
 - Multi-key rotation support

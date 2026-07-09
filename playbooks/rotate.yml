@@ -1,344 +1,43 @@
 ---
-# ssh_key_rotation.yml
-#
-# Rotate SSH keys safely: validate the new key locally, connect with the OLD
-# key, install the NEW (PwC) key, ensure sshd permits pubkey auth, RECONNECT
-# with the NEW key to prove it works, and only THEN remove the OLD key and
-# disable the old way of connecting.
-#
-# Safety model
-#   0. The new key is validated locally (recognized/strong type, and proven
-#      to be the private key's real pair) before it is ever sent to a host.
-#   1. The new key is installed and proven to authenticate BEFORE anything old
-#      is removed. Play 2's first action is to connect with the new key; if that
-#      fails the host errors out and the cleanup tasks never run.
-#   2. Every sshd_config change is validated with `sshd -t` before it is written,
-#      applied with a service *reload* (not restart) so live sessions survive,
-#      and backed up first so a change can be reverted by hand if needed.
-#   3. authorized_keys edits need no reload (sshd reads it per-connection); only
-#      sshd_config edits notify the reload handler. authorized_keys is backed
-#      up before each edit for the same reason.
-#
-# Requirements
-#   ansible-galaxy collection install ansible.posix
-#
-# Example run
-#   ansible-playbook -i inventory.ini ssh_key_rotation.yml \
-#     -e "old_private_key=~/.ssh/id_old" \
-#     -e "new_private_key=~/.ssh/pwc_id_ed25519" \
-#     -e "new_public_key_file=./pwc_id_ed25519.pub" \
-#     -e "old_public_key_file=./id_old.pub" \
-#     --ask-become-pass            # if sudo needs a password
 
-# ---------------------------------------------------------------------------
-# PHASE 0 — local pre-flight validation (no remote connections attempted)
-# ---------------------------------------------------------------------------
-- name: "Phase 0 — validate required variables and the new key locally"
+# Rotates SSH keys safely in three stages: validate locally, install the new key via
+# the old one, then prove the new key works before removing the old key and legacy
+# auth. See README.md for the full safety model, variables, and examples.
+#
+# ansible-playbook -i inventory.ini playbooks/rotate.yml \
+#   -e "old_private_key=~/.ssh/id_old" \
+#   -e "new_private_key=~/.ssh/pwc_id_ed25519" \
+#   -e "new_public_key_file=./pwc_id_ed25519.pub" \
+#   -e "old_public_key_file=./id_old.pub"
+
+- name: Validate | Validate the local system and variables
   hosts: localhost
   connection: local
   gather_facts: false
-  vars:
-    # --- Key recognition / PQC-readiness allowlists -------------------------
-    # Names below must match the string ssh-keygen -l prints in parentheses,
-    # e.g. `256 SHA256:... comment (ED25519)`.
-    #
-    # OpenSSH does not yet ship a post-quantum SIGNATURE algorithm — only
-    # post-quantum KEY EXCHANGE for the transport layer (e.g.
-    # mlkem768x25519-sha256); see https://www.openssh.org/pq.html. There is
-    # therefore no standard "PQC key" to recognize for authorized_keys today.
-    # `pqc_key_types` is a forward-compatible slot: once you adopt a PQC
-    # signature algorithm (e.g. via an OQS-OpenSSH build reporting MLDSA65 or
-    # FALCON1024), add its ssh-keygen type name here — no other playbook
-    # change is required.
-    accepted_key_types:
-      - ED25519
-      - ED25519-SK
-      - ECDSA
-      - ECDSA-SK
-      - RSA
-    pqc_key_types: []
-    reject_key_types:
-      - DSA
-    min_rsa_bits: 3072
-
   tasks:
-    - name: Assert required rotation variables are provided
-      ansible.builtin.assert:
-        that:
-          - old_private_key is defined and old_private_key | length > 0
-          - new_private_key is defined and new_private_key | length > 0
-          - old_public_key_file is defined and old_public_key_file | length > 0
-          - new_public_key_file is defined and new_public_key_file | length > 0
-        fail_msg: >-
-          Missing required variables. Pass all of: old_private_key, new_private_key,
-          old_public_key_file, new_public_key_file (see README.md for an example).
+    - name: Validate | run the role's validate stage
+      ansible.builtin.include_role:
+        name: ssh_key_rotation
+        tasks_from: validate
 
-    - name: Inspect the new public key (type, size, fingerprint)
-      ansible.builtin.command: "ssh-keygen -lf {{ new_public_key_file }}"
-      changed_when: false
-      register: new_key_info
-
-    - name: Parse the new key's type, bit size, and fingerprint
-      ansible.builtin.set_fact:
-        new_key_type: "{{ new_key_info.stdout | regex_search('\\(([^)]+)\\)\\s*$') | regex_replace('[()]', '') }}"
-        new_key_bits: "{{ new_key_info.stdout.split(' ')[0] }}"
-        new_key_fingerprint: "{{ new_key_info.stdout.split(' ')[1] }}"
-
-    - name: Reject known-weak or deprecated key types
-      ansible.builtin.assert:
-        that: new_key_type not in reject_key_types
-        fail_msg: >-
-          new_public_key_file is a {{ new_key_type }} key, which is in reject_key_types
-          ({{ reject_key_types }}). Generate a stronger key (see QUICKSTART.md).
-
-    - name: Require the new key type to be an accepted classical or recognized PQC type
-      ansible.builtin.assert:
-        that: new_key_type in (accepted_key_types + pqc_key_types)
-        fail_msg: >-
-          new_public_key_file has type {{ new_key_type }}, which is not in
-          accepted_key_types or pqc_key_types. Update those lists in
-          playbooks/rotate.yml if this type should be allowed.
-        success_msg: "New key type {{ new_key_type }} is recognized."
-
-    - name: Enforce minimum RSA key size
-      ansible.builtin.assert:
-        that: new_key_bits | int >= min_rsa_bits | int
-        fail_msg: >-
-          new_public_key_file is a {{ new_key_bits }}-bit RSA key; minimum accepted
-          is {{ min_rsa_bits }} bits.
-      when: new_key_type == 'RSA'
-
-    - name: Derive the public key from the new private key
-      ansible.builtin.shell: "set -o pipefail && ssh-keygen -y -f {{ new_private_key }} | ssh-keygen -lf -"
-      args:
-        executable: /bin/bash
-      changed_when: false
-      register: new_key_from_private
-
-    - name: Confirm new_private_key and new_public_key_file are a matching pair
-      ansible.builtin.assert:
-        that: new_key_from_private.stdout.split(' ')[1] == new_key_fingerprint
-        fail_msg: >-
-          new_private_key does not match new_public_key_file (fingerprints differ).
-          Double-check both paths before rotating any hosts.
-        success_msg: "new_private_key and new_public_key_file are a matching pair."
-
-# ---------------------------------------------------------------------------
-# PHASE 1 — connect with the OLD key, install the new key, enable pubkey auth
-# ---------------------------------------------------------------------------
-- name: "Phase 1 — install NEW key & prepare sshd (connect via OLD key)"
+- name: Install | Install the new key and prepare sshd (connect via OLD key)
   hosts: rotate
   gather_facts: true
   vars:
-    target_user: "{{ ansible_user | default(lookup('env', 'USER')) }}"
-    # Force this play to authenticate with the OLD key.
     ansible_ssh_private_key_file: "{{ old_private_key }}"
-
   tasks:
-    - name: Determine the sshd service name for this OS family
-      ansible.builtin.set_fact:
-        sshd_service: "{{ 'ssh' if ansible_os_family == 'Debian' else 'sshd' }}"
+    - name: Install | run the role's install stage
+      ansible.builtin.include_role:
+        name: ssh_key_rotation
+        tasks_from: install
 
-    # Cheap, local, re-derived here (Phase 0 already validated it) so this
-    # play doesn't depend on cross-play variable passing.
-    - name: Re-derive the new key's type for the informational sshd check below
-      ansible.builtin.command: "ssh-keygen -lf {{ new_public_key_file }}"
-      delegate_to: localhost
-      become: false
-      changed_when: false
-      register: new_key_info_p1
-
-    - name: Set the new key type fact for this host
-      ansible.builtin.set_fact:
-        new_key_type: "{{ new_key_info_p1.stdout | regex_search('\\(([^)]+)\\)\\s*$') | regex_replace('[()]', '') }}"
-
-    - name: Check whether authorized_keys already exists
-      ansible.builtin.stat:
-        path: "~{{ target_user }}/.ssh/authorized_keys"
-      register: authorized_keys_stat
-
-    - name: Back up authorized_keys before modifying it
-      ansible.builtin.copy:
-        src: "~{{ target_user }}/.ssh/authorized_keys"
-        dest: "~{{ target_user }}/.ssh/authorized_keys.bak-{{ ansible_date_time.iso8601_basic_short }}"
-        remote_src: true
-        mode: preserve
-      when: authorized_keys_stat.stat.exists
-
-    - name: Install the new (PwC) public key in authorized_keys
-      ansible.posix.authorized_key:
-        user: "{{ target_user }}"
-        key: "{{ lookup('file', new_public_key_file) }}"
-        state: present
-        exclusive: false          # keep the old key for now — we still need it
-
-    - name: Ensure public key authentication is enabled
-      ansible.builtin.lineinfile:
-        path: /etc/ssh/sshd_config
-        regexp: '^#?\s*PubkeyAuthentication'
-        line: 'PubkeyAuthentication yes'
-        validate: 'sshd -t -f %s'
-        backup: true
-      become: true
-      notify: Reload sshd
-
-    - name: Ensure AuthorizedKeysFile points at the default location
-      ansible.builtin.lineinfile:
-        path: /etc/ssh/sshd_config
-        regexp: '^#?\s*AuthorizedKeysFile'
-        line: 'AuthorizedKeysFile .ssh/authorized_keys'
-        validate: 'sshd -t -f %s'
-        backup: true
-      become: true
-      notify: Reload sshd
-
-    # A drop-in (e.g. /etc/ssh/sshd_config.d/50-cloud-init.conf) can override the
-    # main file. If your hosts use drop-ins, write these settings there instead.
-    - name: Detect any sshd_config drop-in files that could override settings
-      ansible.builtin.find:
-        paths: /etc/ssh/sshd_config.d
-        patterns: '*.conf'
-      become: true
-      register: sshd_dropins
-      failed_when: false
-
-    - name: Warn if drop-in config files are present
-      ansible.builtin.debug:
-        msg: >-
-          Drop-in sshd config files found: {{ sshd_dropins.files | map(attribute='path') | list }}.
-          Verify none of them re-enable the settings this playbook is changing.
-      when: sshd_dropins.files | default([]) | length > 0
-
-    # lineinfile only edits the global section of sshd_config. A `Match`
-    # block (e.g. `Match User ...`) can conditionally override settings like
-    # PasswordAuthentication/PubkeyAuthentication for specific users or
-    # groups, and this playbook does not inspect or modify those blocks.
-    - name: Detect Match blocks in sshd_config that could override global settings
-      ansible.builtin.command: "grep -n '^[[:space:]]*Match' /etc/ssh/sshd_config"
-      become: true
-      register: sshd_match_blocks
-      changed_when: false
-      failed_when: false
-
-    - name: Warn if Match blocks are present
-      ansible.builtin.debug:
-        msg: >-
-          sshd_config contains Match block(s): {{ sshd_match_blocks.stdout_lines }}.
-          This playbook only edits the global section — settings inside a Match
-          block are NOT modified and could silently override what this playbook sets.
-      when: sshd_match_blocks.stdout_lines | default([]) | length > 0
-
-    - name: Apply sshd changes now so the new key is usable in Phase 2
-      ansible.builtin.meta: flush_handlers
-
-    - name: Check the effective sshd configuration for the new key's algorithm
-      ansible.builtin.command: sshd -T
-      become: true
-      changed_when: false
-      failed_when: false
-      register: sshd_effective_config
-
-    - name: Warn if sshd's accepted algorithms don't appear to include the new key type
-      ansible.builtin.debug:
-        msg: >-
-          sshd -T on this host does not appear to mention {{ new_key_type }} under
-          PubkeyAcceptedAlgorithms/HostKeyAlgorithms. Phase 2 may fail to authenticate
-          with the new key; review sshd_config before proceeding.
-      when:
-        - sshd_effective_config.rc == 0
-        - new_key_type | lower not in (sshd_effective_config.stdout | lower)
-
-  handlers:
-    - name: Reload sshd
-      ansible.builtin.service:
-        name: "{{ sshd_service }}"
-        state: reloaded
-      become: true
-
-# ---------------------------------------------------------------------------
-# PHASE 2 — RECONNECT with the NEW key, verify, then remove the OLD key
-#           and disable the old way of connecting
-# ---------------------------------------------------------------------------
-- name: "Phase 2 — verify NEW key, then remove OLD key & old auth (connect via NEW key)"
+- name: Verify | Verify the new key and remove the old key (connect via NEW key)
   hosts: rotate
-  gather_facts: true              # gathering facts here is itself a connectivity test
+  gather_facts: false        # gathered explicitly by the verify stage, AFTER resetting the connection
   vars:
-    target_user: "{{ ansible_user | default(lookup('env', 'USER')) }}"
-    # Force this play to authenticate with the NEW key.
     ansible_ssh_private_key_file: "{{ new_private_key }}"
-    disable_password_auth: true   # disable password login = "the old way of connecting"
-    disable_kbd_interactive: true
-    make_exclusive: false         # set true to leave ONLY the PwC key in authorized_keys
-
   tasks:
-    - name: Determine the sshd service name for this OS family
-      ansible.builtin.set_fact:
-        sshd_service: "{{ 'ssh' if ansible_os_family == 'Debian' else 'sshd' }}"
-
-    # Hard safety gate: if the new key cannot authenticate, this fails the host
-    # and nothing below (the destructive part) executes.
-    - name: Confirm the host is reachable using the NEW key
-      ansible.builtin.ping:
-      register: new_key_ping
-
-    - name: Assert the new key authenticated before any deletion
-      ansible.builtin.assert:
-        that: new_key_ping is succeeded
-        fail_msg: "New key did not authenticate — aborting before removing the old key."
-        success_msg: "New (PwC) key verified. Proceeding to remove the old key."
-
-    - name: Back up authorized_keys before removing the old key
-      ansible.builtin.copy:
-        src: "~{{ target_user }}/.ssh/authorized_keys"
-        dest: "~{{ target_user }}/.ssh/authorized_keys.bak-{{ ansible_date_time.iso8601_basic_short }}"
-        remote_src: true
-        mode: preserve
-
-    - name: Remove the OLD public key from authorized_keys
-      ansible.posix.authorized_key:
-        user: "{{ target_user }}"
-        key: "{{ lookup('file', old_public_key_file) }}"
-        state: absent
-
-    - name: (Optional) Make authorized_keys exclusive to the PwC key
-      ansible.posix.authorized_key:
-        user: "{{ target_user }}"
-        key: "{{ lookup('file', new_public_key_file) }}"
-        state: present
-        exclusive: true
-      when: make_exclusive | bool
-
-    - name: Disable password authentication (the old way of connecting)
-      ansible.builtin.lineinfile:
-        path: /etc/ssh/sshd_config
-        regexp: '^#?\s*PasswordAuthentication'
-        line: 'PasswordAuthentication no'
-        validate: 'sshd -t -f %s'
-        backup: true
-      become: true
-      when: disable_password_auth | bool
-      notify: Reload sshd
-
-    - name: Disable keyboard-interactive authentication
-      ansible.builtin.lineinfile:
-        path: /etc/ssh/sshd_config
-        regexp: '^#?\s*KbdInteractiveAuthentication'
-        line: 'KbdInteractiveAuthentication no'
-        validate: 'sshd -t -f %s'
-        backup: true
-      become: true
-      when: disable_kbd_interactive | bool
-      notify: Reload sshd
-
-    - name: Apply final sshd changes
-      ansible.builtin.meta: flush_handlers
-
-    - name: Final connectivity check with the NEW key after lock-down
-      ansible.builtin.ping:
-
-  handlers:
-    - name: Reload sshd
-      ansible.builtin.service:
-        name: "{{ sshd_service }}"
-        state: reloaded
-      become: true
+    - name: Verify | run the role's verify stage
+      ansible.builtin.include_role:
+        name: ssh_key_rotation
+        tasks_from: verify

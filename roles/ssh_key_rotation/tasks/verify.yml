@@ -1,0 +1,67 @@
+---
+
+- name: Verify | Close any connection left open from the install stage before testing the new key
+  ansible.builtin.meta: reset_connection
+
+- name: Verify | New KEY | Gather facts
+  ansible.builtin.setup:
+
+# Hard safety gate: if the new key can't authenticate, this fails the host and nothing below (the destructive part) executes.
+- name: Verify | New KEY | Confirm the host is reachable
+  ansible.builtin.ping:
+  register: ssh_key_rotation_new_key_ping
+
+- name: Verify | New KEY | Assert the key authenticated before any deletion
+  ansible.builtin.assert:
+    that: ssh_key_rotation_new_key_ping is succeeded
+    fail_msg: "New key did not authenticate - aborting before removing the old key."
+    success_msg: "New (PwC) key verified. Proceeding to remove the old key."
+
+- name: Verify | New KEY | Back up authorized_keys before removing the old key
+  ansible.builtin.copy:
+    src: "~{{ ssh_key_rotation_target_user }}/.ssh/authorized_keys"
+    dest: "~{{ ssh_key_rotation_target_user }}/.ssh/authorized_keys.bak-{{ ansible_date_time.iso8601_basic_short }}"
+    remote_src: true
+    mode: preserve
+
+- name: Verify | New KEY | Remove the OLD public key from authorized_keys
+  ansible.posix.authorized_key:
+    user: "{{ ssh_key_rotation_target_user }}"
+    key: "{{ lookup('file', old_public_key_file) }}"
+    state: absent
+
+- name: Verify | (Optional) Make authorized_keys exclusive to the PwC key
+  when: ssh_key_rotation_make_exclusive
+  ansible.posix.authorized_key:
+    user: "{{ ssh_key_rotation_target_user }}"
+    key: "{{ lookup('file', new_public_key_file) }}"
+    state: present
+    exclusive: true
+
+- name: Verify | Disable password authentication (the old way of connecting)
+  when: ssh_key_rotation_disable_password_auth
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^#?\s*PasswordAuthentication'
+    line: 'PasswordAuthentication no'
+    validate: 'sshd -t -f %s'
+    backup: true
+  become: true
+  notify: Reload sshd
+
+- name: Verify | Disable keyboard-interactive authentication
+  when: ssh_key_rotation_disable_kbd_interactive
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^#?\s*KbdInteractiveAuthentication'
+    line: 'KbdInteractiveAuthentication no'
+    validate: 'sshd -t -f %s'
+    backup: true
+  become: true
+  notify: Reload sshd
+
+- name: Verify | Apply final sshd changes
+  ansible.builtin.meta: flush_handlers
+
+- name: Verify | Final connectivity check with the NEW key after lock-down
+  ansible.builtin.ping:

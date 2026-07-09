@@ -81,8 +81,8 @@ ansible-playbook krameff.ssh_key_rotation.rotate \
   -e new_private_key=./pwc_id_ed25519 \
   -e new_public_key_file=./pwc_id_ed25519.pub \
   -e old_public_key_file=~/.ssh/id_rsa.pub \
-  -e disable_password_auth=true \
-  -e disable_kbd_interactive=false
+  -e ssh_key_rotation_disable_password_auth=true \
+  -e ssh_key_rotation_disable_kbd_interactive=false
 ```
 
 ### Keep multiple keys active
@@ -94,12 +94,12 @@ ansible-playbook krameff.ssh_key_rotation.rotate \
   -e new_private_key=./pwc_id_ed25519 \
   -e new_public_key_file=./pwc_id_ed25519.pub \
   -e old_public_key_file=~/.ssh/id_rsa.pub \
-  -e make_exclusive=false
+  -e ssh_key_rotation_make_exclusive=false
 ```
 
 ## Troubleshooting
 
-**"New key did not authenticate"** — Phase 2 cannot connect
+**"New key did not authenticate"** - Phase 2 cannot connect
 - Verify the new key paths are correct
 - Check that Phase 1 completed without errors
 - Confirm the new key is in `~/.ssh/authorized_keys` on the target

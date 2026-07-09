@@ -1,0 +1,28 @@
+---
+galaxy_info:
+  role_name: ssh_key_rotation
+  namespace: krameff
+  author: Krameff Solutions Limited
+  description: Safe, three-stage SSH key rotation with hard safety gates against lockouts
+  license: MIT
+  min_ansible_version: "2.18"
+  platforms:
+    - name: EL
+      versions:
+        - all
+    - name: Fedora
+      versions:
+        - all
+    - name: Ubuntu
+      versions:
+        - all
+    - name: opensuse
+      versions:
+        - all
+  galaxy_tags:
+    - security
+    - ssh
+    - keymanagement
+    - infrastructure
+
+dependencies: []
