@@ -16,17 +16,20 @@ venv/
 *~
 .idea/
 .vscode/
+.cursor/
 *.iml
 .vagrant/
 *.log
 .ansible/
 ansible_collections/
+inventory.ini
 
-# SSH key material — QUICKSTART.md has users generate keys in this directory;
+# SSH key material - QUICKSTART.md has users generate keys in this directory;
 # never commit private keys. Public keys (*.pub) are safe and stay tracked.
 id_*
 !id_*.pub
 *_ed25519
+*_ecdsa
 *_rsa
 pwc_id_*
 !pwc_id_*.pub
