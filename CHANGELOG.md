@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Automatic backups of `authorized_keys` and `sshd_config` before every edit.
 - Opt-in PQC/hybrid algorithm negotiation, off by default. `ssh_key_rotation_pqc_kex_algorithms`, `ssh_key_rotation_pqc_pubkey_algorithms`, and `ssh_key_rotation_pqc_ca_signature_algorithms` get appended to `KexAlgorithms`, `PubkeyAcceptedAlgorithms`/`HostKeyAlgorithms`, and `CASignatureAlgorithms` respectively, validated with `sshd -t` before writing. Phase 0 checks the control node's own ssh client actually supports what's being asked for first, and `ansible_ssh_extra_args` carries the algorithms into this playbook's own connections without touching any file on the control node. `ssh_key_rotation_manage_crypto_policy` and `ssh_key_rotation_crypto_policy_setting` can also manage RHEL/Fedora's system-wide crypto-policy on both ends. Full details in the README's "PQC Algorithm Negotiation" section.
 - `ssh_key_rotation_crypto_policy_setting` now supports RHEL/Fedora's `BASE:MODULE` subpolicy syntax (e.g. `FIPS:PQ`), and before ever calling `update-crypto-policies --set` (on the control node in Phase 0, and the target in Phase 1), the playbook discovers what `*.pmod` modules actually exist under `/usr/share/crypto-policies/policies/modules/` and `/etc/crypto-policies/policies/modules/` and fails fast if a named module isn't present. This was added after finding that AlmaLinux/RHEL 9's `FIPS` policy alone has no PQC key exchange, but ships a built-in `PQ.pmod` module that adds `mlkem768x25519-sha256` when combined as `FIPS:PQ` - confirmed with `sshd -T` against a real AlmaLinux 9.8 host, before and after the switch. See the README's "Combining a base policy with a subpolicy module" section.
+- **Automatic rollback in the verify stage.** Removing the old key and disabling legacy auth now run inside an Ansible `block`/`rescue`. If anything in that block fails, `rescue` immediately restores `authorized_keys` and `sshd_config` from backups taken moments earlier (on the same still-open connection, before it could be lost), reloads sshd, re-confirms connectivity, and fails with a message stating exactly what was restored and why. No separate rollback playbook or manual SSH access is needed for this failure window.
 
 ### Fixed
 
@@ -59,7 +60,6 @@ Found during a real rotation against a RHEL-family host running the `FIPS` crypt
 - [ ] Role for per-OS customization (selinux, firewalld, etc.)
 - [ ] Module for validating `authorized_keys` integrity
 - [ ] Support for key rotation with certificate-based auth
-- [ ] Rollback playbook for emergency key restoration
 - [ ] Ansible test suite with test container targets
 
 ### [2.0.0] - Planned

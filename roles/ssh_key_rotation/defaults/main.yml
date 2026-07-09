@@ -2,7 +2,7 @@
 
 # Default shell to be used for shell commands
 # Could be overridden by inventory etc
-os_default_shell: "/bin/bash"
+ssh_key_rotation_os_default_shell: "/bin/bash"
 
 # Key type allowlists; names must match ssh-keygen -l's parenthesized type, e.g. `256 SHA256:... comment (ED25519)`.
 ssh_key_rotation_accepted_key_types:

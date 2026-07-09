@@ -17,51 +17,111 @@
     fail_msg: "New key did not authenticate - aborting before removing the old key."
     success_msg: "New (PwC) key verified. Proceeding to remove the old key."
 
-- name: Verify | New KEY | Back up authorized_keys before removing the old key
-  ansible.builtin.copy:
-    src: "~{{ ssh_key_rotation_target_user }}/.ssh/authorized_keys"
-    dest: "~{{ ssh_key_rotation_target_user }}/.ssh/authorized_keys.bak-{{ ansible_date_time.iso8601_basic_short }}"
-    remote_src: true
-    mode: preserve
+# Everything below removes access (the old key, then optionally password/keyboard-interactive auth), so
+# if any of it fails partway through, the rescue: section below automatically restores authorized_keys
+# and sshd_config from the backups taken here and fails loudly - rather than leaving the host half-changed.
+- name: Verify | New KEY | Rotate access, with automatic rollback if anything below fails
+  block:
+    - name: Verify | New KEY | Back up authorized_keys before removing the old key
+      ansible.builtin.copy:
+        src: "~{{ ssh_key_rotation_target_user }}/.ssh/authorized_keys"
+        dest: "~{{ ssh_key_rotation_target_user }}/.ssh/authorized_keys.bak-{{ ansible_date_time.iso8601_basic_short }}"
+        remote_src: true
+        mode: preserve
+      register: ssh_key_rotation_authorized_keys_backup
 
-- name: Verify | New KEY | Remove the OLD public key from authorized_keys
-  ansible.posix.authorized_key:
-    user: "{{ ssh_key_rotation_target_user }}"
-    key: "{{ lookup('file', old_public_key_file) }}"
-    state: absent
+    - name: Verify | New KEY | Remove the OLD public key from authorized_keys
+      ansible.posix.authorized_key:
+        user: "{{ ssh_key_rotation_target_user }}"
+        key: "{{ lookup('file', old_public_key_file) }}"
+        state: absent
 
-- name: Verify | (Optional) Make authorized_keys exclusive to the PwC key
-  when: ssh_key_rotation_make_exclusive
-  ansible.posix.authorized_key:
-    user: "{{ ssh_key_rotation_target_user }}"
-    key: "{{ lookup('file', new_public_key_file) }}"
-    state: present
-    exclusive: true
+    - name: Verify | (Optional) Make authorized_keys exclusive to the PwC key
+      when: ssh_key_rotation_make_exclusive
+      ansible.posix.authorized_key:
+        user: "{{ ssh_key_rotation_target_user }}"
+        key: "{{ lookup('file', new_public_key_file) }}"
+        state: present
+        exclusive: true
 
-- name: Verify | Disable password authentication (the old way of connecting)
-  when: ssh_key_rotation_disable_password_auth
-  ansible.builtin.lineinfile:
-    path: /etc/ssh/sshd_config
-    regexp: '^#?\s*PasswordAuthentication'
-    line: 'PasswordAuthentication no'
-    validate: 'sshd -t -f %s'
-    backup: true
-  become: true
-  notify: Reload sshd
+    # Explicit, deterministically-named backup (same pattern as authorized_keys above), so rescue: below
+    # knows exactly which file to restore, rather than chasing lineinfile's own auto-named backup files.
+    - name: Verify | Back up sshd_config before disabling legacy auth
+      when: ssh_key_rotation_disable_password_auth or ssh_key_rotation_disable_kbd_interactive
+      ansible.builtin.copy:
+        src: /etc/ssh/sshd_config
+        dest: "/etc/ssh/sshd_config.bak-{{ ansible_date_time.iso8601_basic_short }}"
+        remote_src: true
+        mode: preserve
+      become: true
+      register: ssh_key_rotation_sshd_config_backup
 
-- name: Verify | Disable keyboard-interactive authentication
-  when: ssh_key_rotation_disable_kbd_interactive
-  ansible.builtin.lineinfile:
-    path: /etc/ssh/sshd_config
-    regexp: '^#?\s*KbdInteractiveAuthentication'
-    line: 'KbdInteractiveAuthentication no'
-    validate: 'sshd -t -f %s'
-    backup: true
-  become: true
-  notify: Reload sshd
+    - name: Verify | Disable password authentication (the old way of connecting)
+      when: ssh_key_rotation_disable_password_auth
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?\s*PasswordAuthentication'
+        line: 'PasswordAuthentication no'
+        validate: 'sshd -t -f %s'
+        backup: true
+      become: true
+      notify: Reload sshd
 
-- name: Verify | Apply final sshd changes
-  ansible.builtin.meta: flush_handlers
+    - name: Verify | Disable keyboard-interactive authentication
+      when: ssh_key_rotation_disable_kbd_interactive
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?\s*KbdInteractiveAuthentication'
+        line: 'KbdInteractiveAuthentication no'
+        validate: 'sshd -t -f %s'
+        backup: true
+      become: true
+      notify: Reload sshd
 
-- name: Verify | Final connectivity check with the NEW key after lock-down
-  ansible.builtin.ping:
+    - name: Verify | Apply final sshd changes
+      ansible.builtin.meta: flush_handlers
+
+    - name: Verify | Final connectivity check with the NEW key after lock-down
+      ansible.builtin.ping:
+
+  rescue:
+    # Guarded with `is succeeded`, not just `is defined`: if the very first task above (the backup itself)
+    # is what failed, nothing has actually changed yet, so there's nothing to restore.
+    - name: Rollback | Restore authorized_keys from the pre-cleanup backup
+      when: ssh_key_rotation_authorized_keys_backup is succeeded
+      ansible.builtin.copy:
+        src: "{{ ssh_key_rotation_authorized_keys_backup.dest }}"
+        dest: "~{{ ssh_key_rotation_target_user }}/.ssh/authorized_keys"
+        remote_src: true
+        mode: preserve
+
+    - name: Rollback | Restore sshd_config from the pre-cleanup backup
+      when: ssh_key_rotation_sshd_config_backup is defined and ssh_key_rotation_sshd_config_backup is succeeded
+      ansible.builtin.copy:
+        src: "{{ ssh_key_rotation_sshd_config_backup.dest }}"
+        dest: /etc/ssh/sshd_config
+        remote_src: true
+        mode: preserve
+      become: true
+
+    - name: Rollback | Reload sshd with the restored configuration
+      when: ssh_key_rotation_sshd_config_backup is defined and ssh_key_rotation_sshd_config_backup is succeeded
+      ansible.builtin.service:
+        name: "{{ ssh_key_rotation_sshd_service }}"
+        state: reloaded
+      become: true
+
+    - name: Rollback | Confirm connectivity still works after rollback
+      ansible.builtin.ping:
+
+    - name: Rollback | Fail with details of what was automatically restored
+      ansible.builtin.fail:
+        msg: >-
+          Verify stage failed partway through cleanup and was automatically rolled back.
+          Original error: {{ ansible_failed_result.msg | default(ansible_failed_result) }}.
+          Restored authorized_keys from
+          {{ ssh_key_rotation_authorized_keys_backup.dest | default('n/a - nothing had changed yet') }}
+          {{ ('and sshd_config from ' + ssh_key_rotation_sshd_config_backup.dest)
+             if (ssh_key_rotation_sshd_config_backup is defined and ssh_key_rotation_sshd_config_backup is succeeded)
+             else '(sshd_config was not touched)' }}.
+          The old key and prior sshd_config are back in place; nothing was left half-changed.

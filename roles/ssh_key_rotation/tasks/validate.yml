@@ -49,10 +49,10 @@
 
 - name: Validate | Derive the public key from the new private key
   ansible.builtin.shell: |
-    set -o pipefail 
+    set -o pipefail
     ssh-keygen -y -f {{ new_private_key }} | ssh-keygen -lf -
   args:
-    executable: "{{ os_default_shell }}"
+    executable: "{{ ssh_key_rotation_os_default_shell }}"
   changed_when: false
   register: ssh_key_rotation_new_key_from_private
 
