@@ -240,7 +240,7 @@ See [CHANGELOG.md](CHANGELOG.md) for planned features:
 - Basic key type/strength/pairing validation now runs in `roles/ssh_key_rotation/tasks/validate.yml`; richer checks (permissions, passphrase detection) are still future work
 - Per-OS customization
 - Key integrity validation module
-- Rollback playbook
+- Automatic rollback in the verify stage's cleanup now runs via `block`/`rescue`, restoring from the backups taken moments earlier on the same connection; a standalone break-glass rollback playbook (for recovering a host after the connection is already lost) is still future work
 - Multi-key rotation support
 - Async key rotation for large fleets
 
