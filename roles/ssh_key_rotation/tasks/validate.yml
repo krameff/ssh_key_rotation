@@ -11,6 +11,40 @@
       Missing required variables. Pass all of: old_private_key, new_private_key,
       old_public_key_file, new_public_key_file (see README.md for an example).
 
+- name: Validate | Confirm old_private_key exists locally
+  ansible.builtin.stat:
+    path: "{{ old_private_key }}"
+  register: ssh_key_rotation_old_private_key_stat
+
+- name: Validate | Fail if old_private_key does not exist
+  ansible.builtin.assert:
+    that: ssh_key_rotation_old_private_key_stat.stat.exists
+    fail_msg: >-
+      old_private_key ({{ old_private_key }}) does not exist locally. A missing old key would
+      otherwise only surface later when Phase 1 tries to connect to a real host.
+
+- name: Validate | Confirm old_public_key_file exists locally
+  ansible.builtin.stat:
+    path: "{{ old_public_key_file }}"
+  register: ssh_key_rotation_old_public_key_stat
+
+- name: Validate | Fail if old_public_key_file does not exist
+  ansible.builtin.assert:
+    that: ssh_key_rotation_old_public_key_stat.stat.exists
+    fail_msg: >-
+      old_public_key_file ({{ old_public_key_file }}) does not exist locally. A missing file here
+      would otherwise only surface in the verify stage, when it tries to look up the old key's
+      contents to remove it from authorized_keys.
+
+- name: Validate | Inspect the old public key (confirms it parses and get its fingerprint)
+  ansible.builtin.command: "ssh-keygen -lf {{ old_public_key_file }}"
+  changed_when: false
+  register: ssh_key_rotation_old_key_info
+
+- name: Validate | Parse the old key's fingerprint
+  ansible.builtin.set_fact:
+    ssh_key_rotation_old_key_fingerprint: "{{ ssh_key_rotation_old_key_info.stdout.split(' ')[1] }}"
+
 - name: Validate | Inspect the new public key (type, size, fingerprint)
   ansible.builtin.command: "ssh-keygen -lf {{ new_public_key_file }}"
   changed_when: false
@@ -21,6 +55,16 @@
     ssh_key_rotation_new_key_type: "{{ ssh_key_rotation_new_key_info.stdout | regex_search('\\(([^)]+)\\)\\s*$') | regex_replace('[()]', '') }}"
     ssh_key_rotation_new_key_bits: "{{ ssh_key_rotation_new_key_info.stdout.split(' ')[0] }}"
     ssh_key_rotation_new_key_fingerprint: "{{ ssh_key_rotation_new_key_info.stdout.split(' ')[1] }}"
+
+- name: Validate | Warn if old_public_key_file and new_public_key_file are the same key
+  when: ssh_key_rotation_old_key_fingerprint == ssh_key_rotation_new_key_fingerprint
+  ansible.builtin.debug:
+    msg: >-
+      old_public_key_file and new_public_key_file have the same fingerprint
+      ({{ ssh_key_rotation_new_key_fingerprint }}). If this isn't an idempotent re-run, double-check
+      both paths - rotating a key against itself has no effect until the verify stage tries to
+      remove "the old key", which is also the only key present, and its final connectivity check
+      then rolls the host back automatically.
 
 - name: Validate | Reject known-weak or deprecated key types
   ansible.builtin.assert:
