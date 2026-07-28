@@ -30,9 +30,10 @@ provisioner:
   name: ansible
   env:
     ANSIBLE_ROLES_PATH: "../../../roles"
-  config_options:
-    defaults:
-      remote_tmp: /root/.ansible/tmp
+  inventory:
+    group_vars:
+      rotate:
+        ansible_remote_tmp: /root/.ansible/tmp
 scenario:
   test_sequence:
     - dependency
