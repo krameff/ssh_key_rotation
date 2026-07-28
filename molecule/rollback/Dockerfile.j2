@@ -1,0 +1,11 @@
+# Molecule managed
+#
+# Wraps the upstream geerlingguy image (already has python/ansible prereqs) with an
+# entrypoint that pre-creates root's ansible remote_tmp dir before systemd starts, so the
+# first ansible task never races container/systemd boot for that mkdir.
+FROM {{ item.image }}
+
+COPY molecule-entrypoint.sh /usr/local/bin/molecule-entrypoint.sh
+RUN chmod +x /usr/local/bin/molecule-entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/molecule-entrypoint.sh"]

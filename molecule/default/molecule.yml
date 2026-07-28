@@ -7,7 +7,7 @@ platforms:
     command: /usr/sbin/init
     privileged: true
     cgroupns_mode: host
-    pre_build_image: true
+    pre_build_image: false
     groups:
       - rotate
   - name: ssh-key-rotation-rockylinux9
@@ -15,7 +15,7 @@ platforms:
     command: /usr/sbin/init
     privileged: true
     cgroupns_mode: host
-    pre_build_image: true
+    pre_build_image: false
     groups:
       - rotate
   - name: ssh-key-rotation-rockylinux10
@@ -23,17 +23,13 @@ platforms:
     command: /usr/sbin/init
     privileged: true
     cgroupns_mode: host
-    pre_build_image: true
+    pre_build_image: false
     groups:
       - rotate
 provisioner:
   name: ansible
   env:
     ANSIBLE_ROLES_PATH: "../../../roles"
-  inventory:
-    group_vars:
-      rotate:
-        ansible_remote_tmp: /root/.ansible/tmp
 scenario:
   test_sequence:
     - dependency
