@@ -4,6 +4,7 @@ profile: production
 exclude_paths:
   - .cache/
   - .github/
+  - molecule/
 
 warn_list:
   - experimental
