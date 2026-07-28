@@ -1,0 +1,60 @@
+---
+# Confirms the rotation actually did what it claims: the new key authenticates, the old key
+# is rejected, authorized_keys/sshd_config reflect the role's (default) settings.
+
+- name: Verify | Confirm rotation results via the NEW key
+  hosts: rotate
+  gather_facts: false
+  vars:
+    ssh_key_rotation_test_dir: "{{ lookup('env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}"
+    ansible_ssh_private_key_file: "{{ ssh_key_rotation_test_dir }}/new_key"
+  tasks:
+    - name: Verify | New key authenticates
+      ansible.builtin.ping:
+
+    - name: Verify | Read authorized_keys
+      ansible.builtin.slurp:
+        src: /root/.ssh/authorized_keys
+      register: ssh_key_rotation_authorized_keys_content
+
+    - name: Verify | New key is present in authorized_keys
+      ansible.builtin.assert:
+        that: >-
+          (ssh_key_rotation_authorized_keys_content.content | b64decode)
+          is search(lookup('file', ssh_key_rotation_test_dir + '/new_key.pub').split()[1])
+
+    - name: Verify | Old key has been removed from authorized_keys
+      ansible.builtin.assert:
+        that: >-
+          not (ssh_key_rotation_authorized_keys_content.content | b64decode)
+          is search(lookup('file', ssh_key_rotation_test_dir + '/old_key.pub').split()[1])
+
+    - name: Verify | Check effective sshd configuration
+      ansible.builtin.command: sshd -T
+      become: true
+      changed_when: false
+      register: ssh_key_rotation_sshd_effective
+
+    - name: Verify | sshd_config reflects the role's default safety settings
+      ansible.builtin.assert:
+        that:
+          - "'pubkeyauthentication yes' in ssh_key_rotation_sshd_effective.stdout | lower"
+          - "'passwordauthentication no' in ssh_key_rotation_sshd_effective.stdout | lower"
+          - "'kbdinteractiveauthentication no' in ssh_key_rotation_sshd_effective.stdout | lower"
+
+- name: Verify | Confirm the OLD key is now rejected
+  hosts: rotate
+  gather_facts: false
+  vars:
+    ssh_key_rotation_test_dir: "{{ lookup('env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}"
+    ansible_ssh_private_key_file: "{{ ssh_key_rotation_test_dir }}/old_key"
+  tasks:
+    - name: Verify | Old key no longer authenticates
+      ansible.builtin.ping:
+      register: ssh_key_rotation_old_key_ping
+      ignore_errors: true
+
+    - name: Verify | Assert the old-key connection attempt failed
+      ansible.builtin.assert:
+        that: ssh_key_rotation_old_key_ping is failed
+        fail_msg: "Old key still authenticates after rotation - it should have been removed."

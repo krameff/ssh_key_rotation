@@ -1,0 +1,57 @@
+---
+# Runs the collection's real entry point (playbooks/rotate.yml, all 3 stages) against the
+# generated inventory/vars from prepare.yml -- this is what proves the shipped playbook works
+# end to end, not just the role in isolation. Then runs it again, unchanged, to prove
+# idempotency: a second identical rotation should report changed=0 across the board.
+
+- name: Converge | Run the real rotation playbook end to end (first pass)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ssh_key_rotation_test_dir: "{{ lookup('env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}"
+    ssh_key_rotation_repo_root: "{{ playbook_dir }}/../.."
+  tasks:
+    - name: Converge | First rotation run
+      ansible.builtin.command: >-
+        ansible-playbook -i {{ ssh_key_rotation_test_dir }}/rotation_inventory.ini
+        {{ ssh_key_rotation_repo_root }}/playbooks/rotate.yml
+        -e @{{ ssh_key_rotation_test_dir }}/rotation_vars.yml
+      environment:
+        ANSIBLE_ROLES_PATH: "{{ ssh_key_rotation_repo_root }}/roles"
+        ANSIBLE_HOST_KEY_CHECKING: "false"
+      changed_when: true
+      register: ssh_key_rotation_first_run
+
+    - name: Converge | Show first run output
+      ansible.builtin.debug:
+        var: ssh_key_rotation_first_run.stdout_lines
+
+    - name: Converge | Second (idempotency) rotation run with identical vars
+      ansible.builtin.command: >-
+        ansible-playbook -i {{ ssh_key_rotation_test_dir }}/rotation_inventory.ini
+        {{ ssh_key_rotation_repo_root }}/playbooks/rotate.yml
+        -e @{{ ssh_key_rotation_test_dir }}/rotation_vars.yml
+      environment:
+        ANSIBLE_ROLES_PATH: "{{ ssh_key_rotation_repo_root }}/roles"
+        ANSIBLE_HOST_KEY_CHECKING: "false"
+      changed_when: true
+      register: ssh_key_rotation_second_run
+
+    - name: Converge | Show second (idempotency) run output
+      ansible.builtin.debug:
+        var: ssh_key_rotation_second_run.stdout_lines
+
+    # The install stage's authorized_keys/lineinfile tasks and verify's authorized_key removal
+    # are only truly idempotent for a repeat run against the SAME old/new key pair. Every PLAY
+    # RECAP line must report changed=0 (validate/install/verify all re-run cleanly with nothing
+    # left to do).
+    - name: Converge | Assert the second run was fully idempotent (no changed tasks in any play)
+      ansible.builtin.assert:
+        that: >-
+          ssh_key_rotation_second_run.stdout_lines
+          | select('match', '.*changed=[1-9].*')
+          | list | length == 0
+        fail_msg: >-
+          Second identical rotation run reported changed tasks - rotation is not idempotent.
+          Recap lines: {{ ssh_key_rotation_second_run.stdout_lines | select('match', '.*ok=.*') | list }}

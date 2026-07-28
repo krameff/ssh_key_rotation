@@ -1,0 +1,95 @@
+---
+# Prepares each Molecule-managed container as a realistic rotation target: an ephemeral
+# "old" keypair pre-authorized (simulating existing access before install.yml ever runs),
+# an ephemeral "new" keypair generated but NOT yet authorized, and a generated inventory +
+# vars file that converge.yml uses to invoke the real playbooks/rotate.yml over actual SSH
+# (not the Molecule docker connection plugin, since that's not what the role uses in production).
+
+- name: Prepare | Generate ephemeral keys and the test inventory on the control node
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ssh_key_rotation_test_dir: "{{ lookup('env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}"
+  tasks:
+    - name: Prepare | Generate the ephemeral OLD (RSA) keypair
+      ansible.builtin.command: "ssh-keygen -t rsa -b 3072 -N '' -f {{ ssh_key_rotation_test_dir }}/old_key"
+      args:
+        creates: "{{ ssh_key_rotation_test_dir }}/old_key"
+
+    - name: Prepare | Generate the ephemeral NEW (ED25519) keypair
+      ansible.builtin.command: "ssh-keygen -t ed25519 -N '' -f {{ ssh_key_rotation_test_dir }}/new_key"
+      args:
+        creates: "{{ ssh_key_rotation_test_dir }}/new_key"
+
+    - name: Prepare | Write the generated rotation vars file used by converge.yml
+      ansible.builtin.copy:
+        dest: "{{ ssh_key_rotation_test_dir }}/rotation_vars.yml"
+        mode: "0600"
+        content: |
+          ---
+          old_private_key: "{{ ssh_key_rotation_test_dir }}/old_key"
+          old_public_key_file: "{{ ssh_key_rotation_test_dir }}/old_key.pub"
+          new_private_key: "{{ ssh_key_rotation_test_dir }}/new_key"
+          new_public_key_file: "{{ ssh_key_rotation_test_dir }}/new_key.pub"
+          ssh_key_rotation_target_user: root
+
+- name: Prepare | Seed the OLD key into each container's authorized_keys (simulates pre-existing access)
+  hosts: rotate
+  gather_facts: false
+  vars:
+    ssh_key_rotation_test_dir: "{{ lookup('env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}"
+  tasks:
+    - name: Prepare | Ensure sshd is running
+      ansible.builtin.systemd:
+        name: sshd
+        state: started
+        enabled: true
+
+    - name: Prepare | Ensure PermitRootLogin allows key auth (test images default to prohibit-password already)
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?\s*PermitRootLogin'
+        line: 'PermitRootLogin prohibit-password'
+      notify: Restart sshd for prepare
+
+    - name: Prepare | Install the ephemeral OLD public key as pre-existing authorized access
+      ansible.posix.authorized_key:
+        user: root
+        key: "{{ lookup('file', ssh_key_rotation_test_dir + '/old_key.pub') }}"
+        state: present
+
+    - name: Prepare | Discover this container's IP address on the docker network
+      ansible.builtin.command: hostname -I
+      changed_when: false
+      register: ssh_key_rotation_container_ip
+
+    - name: Prepare | Record this container's IP for the generated inventory
+      ansible.builtin.set_fact:
+        ssh_key_rotation_container_ip: "{{ ssh_key_rotation_container_ip.stdout.split() | first }}"
+
+    - name: Prepare | Append this host to the generated rotation inventory
+      ansible.builtin.lineinfile:
+        path: "{{ ssh_key_rotation_test_dir }}/rotation_inventory.ini"
+        create: true
+        mode: "0600"
+        line: >-
+          {{ inventory_hostname }} ansible_host={{ ssh_key_rotation_container_ip }} ansible_user=root
+          ansible_ssh_common_args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+        insertafter: EOF
+      delegate_to: localhost
+
+    - name: Prepare | Ensure the [rotate] group header is present in the generated inventory
+      ansible.builtin.lineinfile:
+        path: "{{ ssh_key_rotation_test_dir }}/rotation_inventory.ini"
+        line: "[rotate]"
+        insertbefore: BOF
+        create: true
+      delegate_to: localhost
+      run_once: true
+
+  handlers:
+    - name: Restart sshd for prepare
+      ansible.builtin.systemd:
+        name: sshd
+        state: restarted

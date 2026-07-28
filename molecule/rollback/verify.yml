@@ -1,0 +1,39 @@
+---
+# Confirms the rescue: block in roles/ssh_key_rotation/tasks/verify.yml actually restored
+# access after rotation 2 was deliberately broken: key_a (the pre-failure state) must still
+# work, authorized_keys must match the pre-failure checkpoint, and sshd must still be running.
+
+- name: Verify | Confirm key_a still authenticates after the failed/rolled-back rotation
+  hosts: rotate
+  gather_facts: false
+  vars:
+    ssh_key_rotation_test_dir: "{{ lookup('env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}"
+    ansible_ssh_private_key_file: "{{ ssh_key_rotation_test_dir }}/key_a"
+  tasks:
+    - name: Verify | key_a authenticates
+      ansible.builtin.ping:
+
+    - name: Verify | sshd is running
+      ansible.builtin.command: systemctl is-active sshd
+      become: true
+      changed_when: false
+
+    - name: Verify | Read authorized_keys after the failed rotation
+      ansible.builtin.slurp:
+        src: /root/.ssh/authorized_keys
+      register: ssh_key_rotation_post_failure_authorized_keys
+
+    - name: Verify | Load the pre-failure checkpoint
+      ansible.builtin.slurp:
+        src: "{{ ssh_key_rotation_test_dir }}/checkpoint_authorized_keys.{{ inventory_hostname }}"
+      delegate_to: localhost
+      register: ssh_key_rotation_checkpoint_authorized_keys
+
+    - name: Verify | authorized_keys matches the pre-failure checkpoint (nothing left half-changed)
+      ansible.builtin.assert:
+        that: >-
+          (ssh_key_rotation_post_failure_authorized_keys.content | b64decode)
+          == (ssh_key_rotation_checkpoint_authorized_keys.content | b64decode)
+        fail_msg: >-
+          authorized_keys after the failed rotation does not match the pre-failure checkpoint -
+          the rescue block did not fully restore the file.

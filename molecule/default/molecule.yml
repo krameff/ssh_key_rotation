@@ -1,0 +1,43 @@
+---
+driver:
+  name: docker
+platforms:
+  - name: ssh-key-rotation-ubuntu2204
+    image: geerlingguy/docker-ubuntu2204-ansible:latest
+    command: /usr/sbin/init
+    privileged: true
+    cgroupns_mode: host
+    pre_build_image: true
+    groups:
+      - rotate
+  - name: ssh-key-rotation-almalinux9
+    image: geerlingguy/docker-almalinux9-ansible:latest
+    command: /usr/sbin/init
+    privileged: true
+    cgroupns_mode: host
+    pre_build_image: true
+    groups:
+      - rotate
+  - name: ssh-key-rotation-almalinux10
+    image: geerlingguy/docker-almalinux10-ansible:latest
+    command: /usr/sbin/init
+    privileged: true
+    cgroupns_mode: host
+    pre_build_image: true
+    groups:
+      - rotate
+provisioner:
+  name: ansible
+  env:
+    ANSIBLE_ROLES_PATH: "../../../roles"
+scenario:
+  test_sequence:
+    - dependency
+    - syntax
+    - create
+    - prepare
+    - converge
+    - verify
+    - destroy
+verifier:
+  name: ansible

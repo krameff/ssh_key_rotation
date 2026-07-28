@@ -18,3 +18,12 @@ tags:
   - infrastructure
 dependencies:
   ansible.posix: ">=1.3.0"
+build_ignore:
+  - molecule
+  - test_vars.yml
+  - test_rsa
+  - test_rsa.pub
+  - test_ecdsa
+  - test_ecdsa.pub
+  - test_ed25519
+  - test_ed25519.pub
