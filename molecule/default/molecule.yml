@@ -30,6 +30,9 @@ provisioner:
   name: ansible
   env:
     ANSIBLE_ROLES_PATH: "../../../roles"
+    # The docker connection plugin doesn't invoke a login shell, so `~` in the default
+    # remote_tmp path doesn't reliably expand. Pin it to an absolute path instead.
+    ANSIBLE_REMOTE_TMP: /tmp/.ansible-remote-tmp
 scenario:
   test_sequence:
     - dependency
