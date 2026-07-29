@@ -104,13 +104,23 @@
         mode: preserve
       become: true
 
+    # A failed reload must not abort the rollback. authorized_keys and sshd_config are already
+    # restored on disk above, and sshd reads authorized_keys per-connection, so access is back even
+    # if the daemon never re-read its config. rescue: has no rescue of its own, so letting this fail
+    # would skip the two tasks that matter most here: the connectivity check below (the real access
+    # gate) and the diagnostic that tells the operator what was restored. Reported in that message
+    # instead. Note the reload can fail for the very same reason the block did - both use
+    # ssh_key_rotation_sshd_service - so this is the expected path, not an edge case.
     - name: Rollback | Reload sshd with the restored configuration
       when: ssh_key_rotation_sshd_config_backup is defined and ssh_key_rotation_sshd_config_backup is succeeded
       ansible.builtin.service:
         name: "{{ ssh_key_rotation_sshd_service }}"
         state: reloaded
       become: true
+      register: ssh_key_rotation_rollback_reload
+      ignore_errors: true
 
+    # Stays fatal on purpose: this is what proves access survived the rollback.
     - name: Rollback | Confirm connectivity still works after rollback
       ansible.builtin.ping:
 
@@ -125,3 +135,10 @@
              if (ssh_key_rotation_sshd_config_backup is defined and ssh_key_rotation_sshd_config_backup is succeeded)
              else '(sshd_config was not touched)' }}.
           The old key and prior sshd_config are back in place; nothing was left half-changed.
+          {{ ('WARNING: sshd could not be reloaded during the rollback ('
+              ~ (ssh_key_rotation_rollback_reload.msg | default('unknown error'))
+              ~ ') - the restored sshd_config is on disk but is NOT yet active. Reload or restart'
+              ~ ' sshd manually to activate it. Key-based access is unaffected, since sshd reads'
+              ~ ' authorized_keys per connection.')
+             if (ssh_key_rotation_rollback_reload is defined and ssh_key_rotation_rollback_reload is failed)
+             else '' }}

@@ -15,6 +15,17 @@ RUN apt-get update \
 {% else %}
 RUN dnf install -y openssh-server \
     && dnf clean all
+
+# rockylinux9 ships /etc/shadow as mode 0000 (the RHEL default) but with a pam old enough
+# (1.5.1-28.el9) that pam_unix's ACCOUNT phase resolves shadow via the unix_chkpwd helper.
+# That helper links libcap-ng and deliberately drops its capabilities, so it loses
+# DAC_OVERRIDE and cannot open a 0000 file even as uid 0 - the lookup fails with
+# PAM_AUTHINFO_UNAVAIL. sshd (UsePAM yes) then rejects every login with "Access denied for
+# user root by PAM account configuration", which the client sees as a bare
+# "Connection closed by <host> port 22"; sudo fails the same way. rockylinux10's pam 1.6.1
+# does not use the helper here, which is why only rockylinux9 is affected.
+# 0400 root:root is still root-only, so this grants no access that 0000 didn't already imply.
+RUN chmod 0400 /etc/shadow
 {% endif %}
 
 COPY molecule-entrypoint.sh /usr/local/bin/molecule-entrypoint.sh
