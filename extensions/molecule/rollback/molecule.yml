@@ -54,6 +54,13 @@ provisioner:
       # playbooks and the key-generation play) must keep its normal, non-root remote_tmp.
       rotate:
         ansible_remote_tmp: /root/.ansible/tmp
+        # These containers are entered as root. Saying so explicitly means Ansible skips
+        # become for the role's `become: true` tasks (become_user root == remote_user root)
+        # instead of shelling out to sudo. Without this, sudo runs and fails on images whose
+        # pam/shadow setup can't serve an account lookup inside a container (seen on
+        # rockylinux9: "PAM account management error: Authentication service cannot retrieve
+        # authentication info"), which has nothing to do with what these tests are proving.
+        ansible_user: root
 scenario:
   test_sequence:
     - syntax
