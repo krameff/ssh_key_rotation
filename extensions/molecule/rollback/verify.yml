@@ -8,10 +8,26 @@
   gather_facts: false
   vars:
     ssh_key_rotation_test_dir: "{{ lookup('env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}"
-    ansible_ssh_private_key_file: "{{ ssh_key_rotation_test_dir }}/key_a"
+    ssh_key_rotation_verify_ssh_opts: >-
+      -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+      -o IdentitiesOnly=yes -o ConnectTimeout=15
   tasks:
-    - name: Verify | key_a authenticates
-      ansible.builtin.ping:
+    - name: Verify | Discover this container's IP address for the real SSH check
+      ansible.builtin.command: hostname -I
+      changed_when: false
+      register: ssh_key_rotation_verify_container_ip
+
+    # Has to be a real ssh client: molecule's docker driver reaches this group over
+    # ansible_connection=community.docker.docker, which ignores ansible_ssh_private_key_file, so an
+    # ansible.builtin.ping here succeeds no matter which key is passed (it returns "pong" even for a
+    # nonexistent key file) and would prove nothing about key_a still working. This is THE assertion
+    # the whole rollback scenario exists to make, so it must exercise the real transport.
+    - name: Verify | key_a authenticates over real SSH after the rollback
+      ansible.builtin.command: >-
+        ssh -i {{ ssh_key_rotation_test_dir }}/key_a {{ ssh_key_rotation_verify_ssh_opts }}
+        root@{{ ssh_key_rotation_verify_container_ip.stdout.split() | first }} true
+      delegate_to: localhost
+      changed_when: false
 
     - name: Verify | sshd is running
       ansible.builtin.command: systemctl is-active sshd
@@ -29,11 +45,41 @@
       delegate_to: localhost
       register: ssh_key_rotation_checkpoint_authorized_keys
 
-    - name: Verify | authorized_keys matches the pre-failure checkpoint (nothing left half-changed)
+    # Superset, not exact equality. The checkpoint is taken after rotation 1, i.e. BEFORE rotation
+    # 2's install stage adds key_b, whereas the rescue block restores the backup taken at the start
+    # of the VERIFY stage - which already contains key_b. Demanding an exact match would therefore
+    # require the rescue to undo the install stage, which it does not claim to do and should not:
+    # install is purely additive (it adds the new key and removes nothing), so it leaves nothing
+    # unsafe behind. The property that actually matters is that no key authorized before the failed
+    # rotation was lost - i.e. the known-good access is back. key_b remaining is expected and benign:
+    # it is a key the operator deliberately installed and holds the private half of.
+    - name: Verify | No authorized key from the pre-failure checkpoint was lost in the rollback
+      vars:
+        ssh_key_rotation_checkpoint_key_lines: >-
+          {{ (ssh_key_rotation_checkpoint_authorized_keys.content | b64decode).splitlines()
+             | map('trim') | reject('eq', '') | list }}
+        ssh_key_rotation_post_failure_key_lines: >-
+          {{ (ssh_key_rotation_post_failure_authorized_keys.content | b64decode).splitlines()
+             | map('trim') | reject('eq', '') | list }}
+      ansible.builtin.assert:
+        that: >-
+          ssh_key_rotation_checkpoint_key_lines
+          | difference(ssh_key_rotation_post_failure_key_lines) | length == 0
+        fail_msg: >-
+          authorized_keys is missing key(s) that were present before the failed rotation - the
+          rescue block did not restore access. Missing:
+          {{ ssh_key_rotation_checkpoint_key_lines
+             | difference(ssh_key_rotation_post_failure_key_lines) }}
+        success_msg: >-
+          Every key authorized before the failed rotation is present again after the rollback
+          ({{ ssh_key_rotation_post_failure_key_lines | length }} key(s) now authorized).
+
+    - name: Verify | key_a specifically is back in authorized_keys
       ansible.builtin.assert:
         that: >-
           (ssh_key_rotation_post_failure_authorized_keys.content | b64decode)
-          == (ssh_key_rotation_checkpoint_authorized_keys.content | b64decode)
+          is search(lookup('file', ssh_key_rotation_test_dir + '/key_a.pub').split()[1])
         fail_msg: >-
-          authorized_keys after the failed rotation does not match the pre-failure checkpoint -
-          the rescue block did not fully restore the file.
+          key_a (the known-good key from the successful first rotation) is NOT in authorized_keys
+          after the rollback - the rescue block failed to restore the pre-failure access.
+        success_msg: "key_a is back in authorized_keys after the rollback."
