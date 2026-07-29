@@ -1,0 +1,94 @@
+---
+# Runs the collection's real entry point (playbooks/rotate.yml, all 3 stages) against the
+# generated inventory/vars from prepare.yml -- this is what proves the shipped playbook works
+# end to end, not just the role in isolation. Then runs it again, unchanged, to prove
+# idempotency: a second identical rotation should report changed=0 across the board.
+
+- name: Converge | Run the real rotation playbook end to end (first pass)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ssh_key_rotation_test_dir: "{{ lookup('env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}"
+    ssh_key_rotation_repo_root: "{{ playbook_dir }}/../../.."
+  tasks:
+    - name: Converge | First rotation run
+      ansible.builtin.command: >-
+        ansible-playbook -i {{ ssh_key_rotation_test_dir }}/rotation_inventory.ini
+        {{ ssh_key_rotation_repo_root }}/playbooks/rotate.yml
+        -e @{{ ssh_key_rotation_test_dir }}/rotation_vars.yml
+      environment:
+        ANSIBLE_ROLES_PATH: "{{ ssh_key_rotation_repo_root }}/roles"
+        ANSIBLE_HOST_KEY_CHECKING: "false"
+      changed_when: true
+      register: ssh_key_rotation_first_run
+
+    - name: Converge | Show first run output
+      ansible.builtin.debug:
+        var: ssh_key_rotation_first_run.stdout_lines
+
+    - name: Converge | Second (idempotency) rotation run with identical vars
+      ansible.builtin.command: >-
+        ansible-playbook -i {{ ssh_key_rotation_test_dir }}/rotation_inventory.ini
+        {{ ssh_key_rotation_repo_root }}/playbooks/rotate.yml
+        -e @{{ ssh_key_rotation_test_dir }}/rotation_vars.yml
+      environment:
+        ANSIBLE_ROLES_PATH: "{{ ssh_key_rotation_repo_root }}/roles"
+        ANSIBLE_HOST_KEY_CHECKING: "false"
+        # JSON callback so idempotency can be judged per task below, rather than from the PLAY
+        # RECAP's per-host counts (which can't say WHICH task changed). Warnings still go to
+        # stderr, so stdout stays valid JSON.
+        ANSIBLE_STDOUT_CALLBACK: json
+      changed_when: true
+      register: ssh_key_rotation_second_run
+
+    # The three "Back up ..." tasks write to a dest containing ansible_date_time, so they produce a
+    # new file on every run and can never report changed=0. That's deliberate: each run must
+    # snapshot the state before that run, and reusing a fixed filename would overwrite the original
+    # pre-rotation backup. So they are expected to change, and anything else changing is a real
+    # idempotency regression - which is what this splits apart.
+    - name: Converge | Split the second run's changed tasks into expected backups vs unexpected
+      vars:
+        ssh_key_rotation_second_run_json: "{{ ssh_key_rotation_second_run.stdout | from_json }}"
+      ansible.builtin.set_fact:
+        ssh_key_rotation_unexpected_changed: >-
+          {%- set found = [] -%}
+          {%- for play in ssh_key_rotation_second_run_json.plays -%}
+          {%-   for task in play.tasks -%}
+          {%-     for host, result in task.hosts.items() -%}
+          {%-       if (result.changed | default(false)) and 'Back up' not in task.task.name -%}
+          {%-         set _ = found.append(task.task.name ~ ' on ' ~ host) -%}
+          {%-       endif -%}
+          {%-     endfor -%}
+          {%-   endfor -%}
+          {%- endfor -%}
+          {{ found | unique | list }}
+        ssh_key_rotation_expected_backup_changed: >-
+          {%- set found = [] -%}
+          {%- for play in ssh_key_rotation_second_run_json.plays -%}
+          {%-   for task in play.tasks -%}
+          {%-     for host, result in task.hosts.items() -%}
+          {%-       if (result.changed | default(false)) and 'Back up' in task.task.name -%}
+          {%-         set _ = found.append(task.task.name) -%}
+          {%-       endif -%}
+          {%-     endfor -%}
+          {%-   endfor -%}
+          {%- endfor -%}
+          {{ found | unique | list }}
+
+    - name: Converge | Show what the second (idempotency) run changed
+      ansible.builtin.debug:
+        msg:
+          expected_timestamped_backups: "{{ ssh_key_rotation_expected_backup_changed }}"
+          unexpected_changes: "{{ ssh_key_rotation_unexpected_changed }}"
+
+    - name: Converge | Assert the second run changed nothing beyond the timestamped backups
+      ansible.builtin.assert:
+        that: ssh_key_rotation_unexpected_changed | length == 0
+        fail_msg: >-
+          Second identical rotation run changed task(s) other than the timestamped backups, so
+          rotation is not idempotent: {{ ssh_key_rotation_unexpected_changed }}
+        success_msg: >-
+          Second identical rotation run was idempotent: the only changes were the
+          {{ ssh_key_rotation_expected_backup_changed | length }} timestamped backup file(s),
+          which are re-created on every run by design.

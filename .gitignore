@@ -20,6 +20,7 @@ venv/
 *.iml
 .vagrant/
 *.log
+.mcp.*
 .ansible/
 ansible_collections/
 inventory.ini
