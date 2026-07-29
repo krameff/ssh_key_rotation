@@ -1,4 +1,5 @@
 ---
+
 # Runs the collection's real entry point (playbooks/rotate.yml, all 3 stages) against the
 # generated inventory/vars from prepare.yml -- this is what proves the shipped playbook works
 # end to end, not just the role in isolation. Then runs it again, unchanged, to prove

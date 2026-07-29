@@ -1,4 +1,5 @@
 ---
+
 # Confirms the rescue: block in roles/ssh_key_rotation/tasks/verify.yml actually restored
 # access after rotation 2 was deliberately broken: key_a (the pre-failure state) must still
 # work, authorized_keys must match the pre-failure checkpoint, and sshd must still be running.

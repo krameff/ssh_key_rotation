@@ -1,4 +1,5 @@
 ---
+
 # Confirms the rotation actually did what it claims: the new key authenticates, the old key
 # is rejected, authorized_keys/sshd_config reflect the role's (default) settings.
 

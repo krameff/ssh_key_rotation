@@ -1,4 +1,5 @@
 ---
+
 # Same environment setup as molecule/default: ephemeral keys + a pre-authorized "old" key +
 # a generated inventory. This scenario needs THREE keypairs: seed_key (pre-existing access),
 # key_a (installed by a first, successful rotation used as the "known-good" checkpoint), and

@@ -1,4 +1,5 @@
 ---
+
 namespace: krameff
 name: ssh_key_rotation
 version: 1.0.0

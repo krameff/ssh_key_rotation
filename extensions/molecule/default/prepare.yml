@@ -1,4 +1,5 @@
 ---
+
 # Prepares each Molecule-managed container as a realistic rotation target: an ephemeral
 # "old" keypair pre-authorized (simulating existing access before install.yml ever runs),
 # an ephemeral "new" keypair generated but NOT yet authorized, and a generated inventory +
