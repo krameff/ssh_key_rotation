@@ -17,17 +17,26 @@
         src: /root/.ssh/authorized_keys
       register: ssh_key_rotation_authorized_keys_content
 
+    # Literal `in`, never `is search`: `search` treats its argument as a REGEX, and a base64 key
+    # blob routinely contains `+` (a quantifier), so the pattern silently fails to match a key that
+    # IS present. On the negative assertion below that failure is dangerous rather than merely
+    # flaky - `not (no match)` is True, so it would report the old key as removed while the old key
+    # was still authorized.
     - name: Verify | New key is present in authorized_keys
       ansible.builtin.assert:
         that: >-
-          (ssh_key_rotation_authorized_keys_content.content | b64decode)
-          is search(lookup('file', ssh_key_rotation_test_dir + '/new_key.pub').split()[1])
+          lookup('file', ssh_key_rotation_test_dir + '/new_key.pub').split()[1]
+          in (ssh_key_rotation_authorized_keys_content.content | b64decode)
+        fail_msg: "The new key is not in authorized_keys after rotation."
+        success_msg: "New key is present in authorized_keys."
 
     - name: Verify | Old key has been removed from authorized_keys
       ansible.builtin.assert:
         that: >-
-          not (ssh_key_rotation_authorized_keys_content.content | b64decode)
-          is search(lookup('file', ssh_key_rotation_test_dir + '/old_key.pub').split()[1])
+          lookup('file', ssh_key_rotation_test_dir + '/old_key.pub').split()[1]
+          not in (ssh_key_rotation_authorized_keys_content.content | b64decode)
+        fail_msg: "The old key is STILL in authorized_keys after rotation - it should have been removed."
+        success_msg: "Old key has been removed from authorized_keys."
 
     - name: Verify | Check effective sshd configuration
       ansible.builtin.command: sshd -T

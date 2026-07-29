@@ -74,11 +74,13 @@
           Every key authorized before the failed rotation is present again after the rollback
           ({{ ssh_key_rotation_post_failure_key_lines | length }} key(s) now authorized).
 
+    # Literal `in`, never `is search`: `search` treats its argument as a REGEX and a base64 key blob
+    # routinely contains `+` (a quantifier), so the pattern fails to match a key that IS present.
     - name: Verify | key_a specifically is back in authorized_keys
       ansible.builtin.assert:
         that: >-
-          (ssh_key_rotation_post_failure_authorized_keys.content | b64decode)
-          is search(lookup('file', ssh_key_rotation_test_dir + '/key_a.pub').split()[1])
+          lookup('file', ssh_key_rotation_test_dir + '/key_a.pub').split()[1]
+          in (ssh_key_rotation_post_failure_authorized_keys.content | b64decode)
         fail_msg: >-
           key_a (the known-good key from the successful first rotation) is NOT in authorized_keys
           after the rollback - the rescue block failed to restore the pre-failure access.
