@@ -32,16 +32,10 @@
   gather_facts: true
   vars:
     ssh_key_rotation_test_dir: "{{ lookup('env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}"
-    # These test images don't ship openssh-server by default. Package name is the same on
-    # both families; the service/unit name differs (Debian/Ubuntu: ssh, RedHat/Rocky: sshd).
+    # openssh-server is installed at Dockerfile build time (see Dockerfile.j2), not here. The
+    # service/unit name still differs by family: Debian/Ubuntu: ssh, RedHat/Rocky: sshd.
     ssh_key_rotation_sshd_service: "{{ 'sshd' if ansible_facts['os_family'] == 'RedHat' else 'ssh' }}"
   tasks:
-    - name: Prepare | Ensure the openssh-server package is installed
-      ansible.builtin.package:
-        name: openssh-server
-        state: present
-        update_cache: true
-
     - name: Prepare | Ensure sshd is running
       ansible.builtin.systemd:
         name: "{{ ssh_key_rotation_sshd_service }}"

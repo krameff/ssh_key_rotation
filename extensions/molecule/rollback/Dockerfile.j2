@@ -5,6 +5,18 @@
 # first ansible task never races container/systemd boot for that mkdir.
 FROM {{ item.image }}
 
+# These test images don't ship openssh-server. Install it at build time (not via an Ansible
+# task in prepare.yml) so any slowness/hang shows up in the docker build log instead of being
+# buried in Ansible task output.
+{% if 'ubuntu' in item.image or 'debian' in item.image %}
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssh-server \
+    && rm -rf /var/lib/apt/lists/*
+{% else %}
+RUN dnf install -y openssh-server \
+    && dnf clean all
+{% endif %}
+
 COPY molecule-entrypoint.sh /usr/local/bin/molecule-entrypoint.sh
 RUN chmod +x /usr/local/bin/molecule-entrypoint.sh
 
