@@ -37,7 +37,7 @@
         state: absent
 
     - name: Verify | (Optional) Make authorized_keys exclusive to the PwC key
-      when: ssh_key_rotation_make_exclusive
+      when: ssh_key_rotation_make_exclusive | bool
       ansible.posix.authorized_key:
         user: "{{ ssh_key_rotation_target_user }}"
         key: "{{ lookup('file', new_public_key_file) }}"
@@ -47,7 +47,7 @@
     # Explicit, deterministically-named backup (same pattern as authorized_keys above), so rescue: below
     # knows exactly which file to restore, rather than chasing lineinfile's own auto-named backup files.
     - name: Verify | Back up sshd_config before disabling legacy auth
-      when: ssh_key_rotation_disable_password_auth or ssh_key_rotation_disable_kbd_interactive
+      when: (ssh_key_rotation_disable_password_auth | bool) or (ssh_key_rotation_disable_kbd_interactive | bool)
       ansible.builtin.copy:
         src: /etc/ssh/sshd_config
         dest: "/etc/ssh/sshd_config.bak-{{ ansible_date_time.iso8601_basic_short }}"
@@ -57,7 +57,7 @@
       register: ssh_key_rotation_sshd_config_backup
 
     - name: Verify | Disable password authentication (the old way of connecting)
-      when: ssh_key_rotation_disable_password_auth
+      when: ssh_key_rotation_disable_password_auth | bool
       ansible.builtin.lineinfile:
         path: /etc/ssh/sshd_config
         regexp: '^#?\s*PasswordAuthentication'
@@ -68,7 +68,7 @@
       notify: Reload sshd
 
     - name: Verify | Disable keyboard-interactive authentication
-      when: ssh_key_rotation_disable_kbd_interactive
+      when: ssh_key_rotation_disable_kbd_interactive | bool
       ansible.builtin.lineinfile:
         path: /etc/ssh/sshd_config
         regexp: '^#?\s*KbdInteractiveAuthentication'
