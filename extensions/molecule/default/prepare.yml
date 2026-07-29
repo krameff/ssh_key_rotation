@@ -94,6 +94,7 @@
         line: "[rotate]"
         insertbefore: BOF
         create: true
+        mode: "0600"
       delegate_to: localhost
       run_once: true
 

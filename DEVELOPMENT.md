@@ -131,7 +131,7 @@ ansible-lint
 
 ### Integration Testing with Molecule
 
-Two scenarios live under `molecule/` and run the real `playbooks/rotate.yml` (or, for
+Two scenarios live under `extensions/molecule/` and run the real `playbooks/rotate.yml` (or, for
 the rollback scenario, the role's stages directly) against live Docker containers
 (Ubuntu 22.04, AlmaLinux 9, AlmaLinux 10) with sshd running:
 
