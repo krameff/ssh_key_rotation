@@ -1,0 +1,91 @@
+---
+
+# Same environment setup as molecule/default: ephemeral keys + a pre-authorized "old" key +
+# a generated inventory. This scenario needs THREE keypairs: seed_key (pre-existing access),
+# key_a (installed by a first, successful rotation used as the "known-good" checkpoint), and
+# key_b (the second rotation, deliberately broken partway through verify, to prove the
+# rescue block restores access to key_a).
+
+- name: Prepare | Generate ephemeral keys and the test inventory on the control node
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ssh_key_rotation_test_dir: "{{ lookup('env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}"
+  tasks:
+    - name: Prepare | Generate the ephemeral SEED (pre-existing) keypair
+      ansible.builtin.command: "ssh-keygen -t rsa -b 3072 -N '' -f {{ ssh_key_rotation_test_dir }}/seed_key"
+      args:
+        creates: "{{ ssh_key_rotation_test_dir }}/seed_key"
+
+    - name: Prepare | Generate the ephemeral KEY_A keypair (first, successful rotation)
+      ansible.builtin.command: "ssh-keygen -t ed25519 -N '' -f {{ ssh_key_rotation_test_dir }}/key_a"
+      args:
+        creates: "{{ ssh_key_rotation_test_dir }}/key_a"
+
+    - name: Prepare | Generate the ephemeral KEY_B keypair (second, deliberately broken rotation)
+      ansible.builtin.command: "ssh-keygen -t ed25519 -N '' -f {{ ssh_key_rotation_test_dir }}/key_b"
+      args:
+        creates: "{{ ssh_key_rotation_test_dir }}/key_b"
+
+- name: Prepare | Seed the SEED key into each container's authorized_keys
+  hosts: rotate
+  gather_facts: true
+  vars:
+    ssh_key_rotation_test_dir: "{{ lookup('env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}"
+    # openssh-server is installed at Dockerfile build time (see Dockerfile.j2), not here. The
+    # service/unit name still differs by family: Debian/Ubuntu: ssh, RedHat/Rocky: sshd.
+    ssh_key_rotation_sshd_service: "{{ 'sshd' if ansible_facts['os_family'] == 'RedHat' else 'ssh' }}"
+  tasks:
+    - name: Prepare | Ensure sshd is running
+      ansible.builtin.systemd:
+        name: "{{ ssh_key_rotation_sshd_service }}"
+        state: started
+        enabled: true
+
+    - name: Prepare | Ensure PermitRootLogin allows key auth
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?\s*PermitRootLogin'
+        line: 'PermitRootLogin prohibit-password'
+      notify: Restart sshd for prepare
+
+    - name: Prepare | Install the ephemeral SEED public key as pre-existing authorized access
+      ansible.posix.authorized_key:
+        user: root
+        key: "{{ lookup('file', ssh_key_rotation_test_dir + '/seed_key.pub') }}"
+        state: present
+
+    - name: Prepare | Discover this container's IP address on the docker network
+      ansible.builtin.command: hostname -I
+      changed_when: false
+      register: ssh_key_rotation_container_ip
+
+    - name: Prepare | Record this container's IP for the generated inventory
+      ansible.builtin.set_fact:
+        ssh_key_rotation_container_ip: "{{ ssh_key_rotation_container_ip.stdout.split() | first }}"
+
+    - name: Prepare | Ensure the [rotate] group header is present in the generated inventory
+      ansible.builtin.lineinfile:
+        path: "{{ ssh_key_rotation_test_dir }}/rotation_inventory.ini"
+        line: "[rotate]"
+        insertbefore: BOF
+        create: true
+        mode: "0600"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Prepare | Append this host to the generated rotation inventory
+      ansible.builtin.lineinfile:
+        path: "{{ ssh_key_rotation_test_dir }}/rotation_inventory.ini"
+        line: >-
+          {{ inventory_hostname }} ansible_host={{ ssh_key_rotation_container_ip }} ansible_user=root
+          ansible_ssh_common_args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+        insertafter: EOF
+      delegate_to: localhost
+
+  handlers:
+    - name: Restart sshd for prepare
+      ansible.builtin.systemd:
+        name: "{{ ssh_key_rotation_sshd_service }}"
+        state: restarted

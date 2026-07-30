@@ -16,8 +16,13 @@ krameff-ssh_key_rotation/
 ├── .ansible-lint           # ansible-lint configuration (production profile)
 ├── .github/
 │   └── workflows/
-│       └── ci.yml          # Lint + syntax-check on push/PR
+│       ├── ci.yml          # Lint + syntax-check on push/PR
+│       └── molecule.yml    # Functional Molecule/Docker tests (default + rollback scenarios) on push/PR
 ├── ansible.cfg             # Sets roles_path so playbooks/rotate.yml finds roles/ without installing the collection
+├── extensions/
+│   └── molecule/           # Molecule scenarios (the location current Molecule expects)
+│       ├── default/        # Full rotation over real SSH, twice, to also prove idempotency
+│       └── rollback/       # Breaks a rotation mid-verify to prove the rescue block restores access
 ├── meta/
 │   └── runtime.yml         # Ansible version requirements
 ├── playbooks/
@@ -128,15 +133,29 @@ ansible-playbook -i inventory.ini playbooks/rotate.yml --check
 ansible-lint
 ```
 
-### Integration Testing with Molecule (Future)
+### Integration Testing with Molecule
+
+Two scenarios live under `extensions/molecule/` and run the real `playbooks/rotate.yml` (or, for
+the rollback scenario, the role's stages directly) against live Docker containers
+(Ubuntu 22.04, Rocky Linux 9, Rocky Linux 10) with sshd installed and running:
 
 ```bash
-# Create a scenario
-molecule init scenario -d <driver> -s <scenario_name>
+pip install "molecule>=25.0" "molecule-plugins[docker]"
 
-# Test the scenario
-molecule test
+# Full rotation + idempotency check
+molecule test -s default
+
+# Deliberately breaks the second rotation mid-verify to prove the block/rescue
+# in roles/ssh_key_rotation/tasks/verify.yml actually restores access
+molecule test -s rollback
 ```
+
+Both scenarios generate their own ephemeral SSH keypairs and inventory into Molecule's
+per-run ephemeral directory - they do not use the root-level `test_vars.yml` or
+`test_rsa*`/`test_ecdsa*`/`test_ed25519` files. Those root-level files are for local,
+manual testing only (e.g. `ansible-playbook -i inventory.ini playbooks/rotate.yml -e
+@test_vars.yml`); edit `test_vars.yml`'s paths for your own machine before using it, since
+the checked-in paths are just examples.
 
 ## Building and Publishing
 

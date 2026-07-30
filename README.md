@@ -269,7 +269,7 @@ The whole point of this playbook is that you should never be able to lock yourse
 - Every `sshd_config` change is validated with `sshd -t` before it's written.
 - Configuration is applied with a reload, never a restart, so sessions already open stay open.
 - `sshd_config` and `authorized_keys` are both backed up before every edit, so you can always roll back by hand.
-- Phase 2's cleanup (removing the old key, disabling legacy auth) runs inside an Ansible `block`/`rescue`. If anything in it fails partway through, `rescue` automatically restores `authorized_keys` and `sshd_config` from the backups just taken, reloads sshd, re-confirms connectivity, and fails with a clear message - all on the same still-open connection, before it could be lost.
+- Phase 2's cleanup (removing the old key, disabling legacy auth) runs inside an Ansible `block`/`rescue`. If anything in it fails partway through, `rescue` automatically restores `authorized_keys` and `sshd_config` from the backups just taken, reloads sshd, re-confirms connectivity, and fails with a clear message - all on the same still-open connection, before it could be lost. A reload that itself fails does not abort the rollback: the restored files are already on disk and sshd reads `authorized_keys` per connection, so the rollback finishes and the failure message tells you to reload sshd by hand.
 
 ### Phase 0: validate locally
 
@@ -296,7 +296,7 @@ The whole point of this playbook is that you should never be able to lock yourse
 2. Reconnect and gather facts with the new private key - this is the authentication gate
 3. Ping the host to confirm the new key works
 4. Assert the new key actually authenticated before doing anything else
-5. From here on, steps 6-10 run inside a `block`/`rescue`: if any of them fail, `rescue` automatically restores `authorized_keys` and `sshd_config` from the backups taken below, reloads sshd, re-confirms connectivity, and fails with a clear message instead of leaving the host half-changed
+5. From here on, steps 6-10 run inside a `block`/`rescue`: if any of them fail, `rescue` automatically restores `authorized_keys` and `sshd_config` from the backups taken below, reloads sshd (best effort - a failed reload is reported, not fatal, since the restored files are already in place), re-confirms connectivity, and fails with a clear message instead of leaving the host half-changed
 6. Back up `authorized_keys`, then remove the old public key from it
 7. Optionally make `authorized_keys` exclusive to the new key
 8. Disable legacy auth methods (password, keyboard-interactive) if requested, backing up `sshd_config` first

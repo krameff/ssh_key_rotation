@@ -1,0 +1,108 @@
+---
+
+# Confirms the rotation actually did what it claims: the new key authenticates, the old key
+# is rejected, authorized_keys/sshd_config reflect the role's (default) settings.
+
+- name: Verify | Confirm rotation results via the NEW key
+  hosts: rotate
+  gather_facts: false
+  vars:
+    ssh_key_rotation_test_dir: "{{ lookup('env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}"
+    ansible_ssh_private_key_file: "{{ ssh_key_rotation_test_dir }}/new_key"
+  tasks:
+    - name: Verify | New key authenticates
+      ansible.builtin.ping:
+
+    - name: Verify | Read authorized_keys
+      ansible.builtin.slurp:
+        src: /root/.ssh/authorized_keys
+      register: ssh_key_rotation_authorized_keys_content
+
+    # Literal `in`, never `is search`: `search` treats its argument as a REGEX, and a base64 key
+    # blob routinely contains `+` (a quantifier), so the pattern silently fails to match a key that
+    # IS present. On the negative assertion below that failure is dangerous rather than merely
+    # flaky - `not (no match)` is True, so it would report the old key as removed while the old key
+    # was still authorized.
+    - name: Verify | New key is present in authorized_keys
+      ansible.builtin.assert:
+        that: >-
+          lookup('file', ssh_key_rotation_test_dir + '/new_key.pub').split()[1]
+          in (ssh_key_rotation_authorized_keys_content.content | b64decode)
+        fail_msg: "The new key is not in authorized_keys after rotation."
+        success_msg: "New key is present in authorized_keys."
+
+    - name: Verify | Old key has been removed from authorized_keys
+      ansible.builtin.assert:
+        that: >-
+          lookup('file', ssh_key_rotation_test_dir + '/old_key.pub').split()[1]
+          not in (ssh_key_rotation_authorized_keys_content.content | b64decode)
+        fail_msg: "The old key is STILL in authorized_keys after rotation - it should have been removed."
+        success_msg: "Old key has been removed from authorized_keys."
+
+    - name: Verify | Check effective sshd configuration
+      ansible.builtin.command: sshd -T
+      become: true
+      changed_when: false
+      register: ssh_key_rotation_sshd_effective
+
+    - name: Verify | sshd_config reflects the role's default safety settings
+      ansible.builtin.assert:
+        that:
+          - "'pubkeyauthentication yes' in ssh_key_rotation_sshd_effective.stdout | lower"
+          - "'passwordauthentication no' in ssh_key_rotation_sshd_effective.stdout | lower"
+          - "'kbdinteractiveauthentication no' in ssh_key_rotation_sshd_effective.stdout | lower"
+
+# This has to drive a real ssh client, not ansible's ping. Molecule's docker driver reaches the
+# rotate group over ansible_connection=community.docker.docker, which ignores
+# ansible_ssh_private_key_file completely - a ping there returns "pong" even when handed a
+# nonexistent key file, so it can never demonstrate that sshd rejected the old key. The checks
+# below run ssh from the control node against the container's own IP (the same path converge uses),
+# with IdentitiesOnly=yes so ssh cannot quietly fall back to some other identity and pass.
+- name: Verify | Confirm the OLD key is now rejected over a real SSH connection
+  hosts: rotate
+  gather_facts: false
+  vars:
+    ssh_key_rotation_test_dir: "{{ lookup('env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}"
+    ssh_key_rotation_verify_ssh_opts: >-
+      -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+      -o IdentitiesOnly=yes -o ConnectTimeout=15
+  tasks:
+    - name: Verify | Discover this container's IP address for the real SSH checks
+      ansible.builtin.command: hostname -I
+      changed_when: false
+      register: ssh_key_rotation_verify_container_ip
+
+    # Positive control, and it runs first on purpose: without it, a host where sshd rejects
+    # EVERY key (wiped authorized_keys, broken sshd) would satisfy the old-key assertion below
+    # and pass while access had actually been lost.
+    - name: Verify | NEW key authenticates over real SSH (positive control)
+      ansible.builtin.command: >-
+        ssh -i {{ ssh_key_rotation_test_dir }}/new_key {{ ssh_key_rotation_verify_ssh_opts }}
+        root@{{ ssh_key_rotation_verify_container_ip.stdout.split() | first }} true
+      delegate_to: localhost
+      changed_when: false
+
+    - name: Verify | Attempt a real SSH connection with the OLD key (must be refused)
+      ansible.builtin.command: >-
+        ssh -i {{ ssh_key_rotation_test_dir }}/old_key {{ ssh_key_rotation_verify_ssh_opts }}
+        root@{{ ssh_key_rotation_verify_container_ip.stdout.split() | first }} true
+      delegate_to: localhost
+      changed_when: false
+      failed_when: false
+      register: ssh_key_rotation_old_key_ssh
+
+    # Both conditions matter: a non-zero rc alone would also be satisfied by a timeout or a
+    # refused connection, which would hide a broken test environment behind a passing assertion.
+    # Requiring sshd's own "Permission denied" proves the daemon answered and rejected the key.
+    - name: Verify | Assert sshd refused the OLD key
+      ansible.builtin.assert:
+        that:
+          - ssh_key_rotation_old_key_ssh.rc != 0
+          - "'permission denied' in (ssh_key_rotation_old_key_ssh.stderr | default('') | lower)"
+        fail_msg: >-
+          Old key still authenticates after rotation - it should have been removed.
+          ssh exited {{ ssh_key_rotation_old_key_ssh.rc }};
+          stderr: {{ ssh_key_rotation_old_key_ssh.stderr | default('(none)') }}
+        success_msg: >-
+          sshd refused the old key with "Permission denied", while the new key still
+          authenticates over the same SSH path - rotation removed old access as intended.

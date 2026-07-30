@@ -1,4 +1,5 @@
 ---
+
 # Ansible Galaxy requirements for the SSH Key Rotation collection
 # Install with: ansible-galaxy install -r requirements.yml
 
