@@ -35,11 +35,17 @@ dependency:
   command: ansible-galaxy install -r requirements.yml
 provisioner:
   name: ansible
-  # Deliberately no ANSIBLE_ROLES_PATH here. Molecule runs with the project directory as its
-  # cwd, not the scenario directory, so a scenario-relative value resolves outside the repo and,
-  # worse, overrides the roles_path in the collection's own ansible.cfg - which is what makes a
-  # bare `ssh_key_rotation` role name resolve. Leaving it unset lets ansible.cfg do its job.
-  # The converge that shells out to playbooks/rotate.yml sets its own absolute path.
+  env:
+    # This scenario's converge shells out to playbooks/rotate.yml with its own absolute roles
+    # path, so nothing here strictly needs this today. It is set anyway to keep both scenarios
+    # identical and to stay correct if a play here ever includes the role directly. Two traps:
+    # the collection's own ansible.cfg (roles_path = ./roles) is NOT consulted, because
+    # Molecule generates its own ansible.cfg and points ANSIBLE_CONFIG at it; and Molecule
+    # runs with the project directory as cwd, not the scenario directory, so a
+    # scenario-relative path like ../../../roles resolves outside the repo entirely.
+    # MOLECULE_PROJECT_DIRECTORY is the collection root, and the `.` fallback is the same
+    # thing whenever it isn't exported, since Molecule chdirs there before running a sequence.
+    ANSIBLE_ROLES_PATH: "${MOLECULE_PROJECT_DIRECTORY:-.}/roles"
   inventory:
     group_vars:
       # The docker connection plugin doesn't invoke a login shell, so `~` in the default

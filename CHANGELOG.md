@@ -11,7 +11,7 @@
 - Molecule idempotency check required `changed=0` from the timestamped backup tasks, which cannot be idempotent by design; it now allows those and fails on anything else.
 - Molecule rollback check compared `authorized_keys` against a checkpoint taken before the install stage, demanding the rescue undo work it never performs.
 - Molecule rollback "sshd is running" check hardcoded the `sshd` unit, which resolves on Ubuntu only through an alias; it now uses the same family lookup as prepare.
-- Molecule set `ANSIBLE_ROLES_PATH` to a scenario-relative path, but Molecule runs with the project directory as its cwd, so it resolved outside the repo and overrode the `roles_path` in `ansible.cfg` that makes a bare `ssh_key_rotation` role name resolve. Removed, so `ansible.cfg` applies.
+- Molecule set `ANSIBLE_ROLES_PATH` to a scenario-relative path (`../../../roles`), but Molecule runs with the project directory as its cwd, so it resolved outside the repo entirely and the rollback scenario could not find the role. The collection's own `ansible.cfg` cannot cover for it either, since Molecule generates its own `ansible.cfg` and points `ANSIBLE_CONFIG` at it. It is now `${MOLECULE_PROJECT_DIRECTORY:-.}/roles`, which is the collection root in both cases.
 - The default scenario's first verify play was named as a new-key authentication check but runs over the container connection, which ignores SSH keys, so it could never fail; it is now named and documented as the reachability check it actually is. The key-authentication proof was already in the following play, which drives a real ssh client.
 
 ### Changed
