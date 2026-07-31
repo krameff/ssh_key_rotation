@@ -10,11 +10,19 @@
 - Molecule key-authentication checks ran over the container connection, which ignores SSH keys and so could never detect a failure; they now drive a real ssh client.
 - Molecule idempotency check required `changed=0` from the timestamped backup tasks, which cannot be idempotent by design; it now allows those and fails on anything else.
 - Molecule rollback check compared `authorized_keys` against a checkpoint taken before the install stage, demanding the rescue undo work it never performs.
+- Molecule rollback "sshd is running" check hardcoded the `sshd` unit, which resolves on Ubuntu only through an alias; it now uses the same family lookup as prepare.
+- Molecule set `ANSIBLE_ROLES_PATH` to a scenario-relative path, but Molecule runs with the project directory as its cwd, so it resolved outside the repo and overrode the `roles_path` in `ansible.cfg` that makes a bare `ssh_key_rotation` role name resolve. Removed, so `ansible.cfg` applies.
+- The default scenario's first verify play was named as a new-key authentication check but runs over the container connection, which ignores SSH keys, so it could never fail; it is now named and documented as the reachability check it actually is. The key-authentication proof was already in the following play, which drives a real ssh client.
 
 ### Changed
 
 - Molecule scenarios moved from `molecule/` to `extensions/molecule/`, which also corrects the relative roles path.
 - Molecule test images install `openssh-server` at build time rather than during prepare.
+- Both Molecule scenarios now share one `extensions/molecule/resources/Dockerfile.j2` and one `resources/prepare.yml`; each scenario's `prepare.yml` is a short wrapper that supplies only its own keypairs and which one to pre-authorize.
+- Root's Ansible `remote_tmp` directory is created during the image build instead of by an entrypoint wrapper, so it exists before the container ever starts and `molecule-entrypoint.sh` is gone from both scenarios.
+- Molecule platform definitions use a YAML anchor rather than repeating three near-identical blocks per scenario.
+- Molecule test sequences start with `dependency` and `destroy`: collection dependencies are installed the same way locally and in CI (the workflow's separate `ansible-galaxy` step is gone), and a container left behind by an aborted run can no longer be reused with keys already in its `authorized_keys`.
+- The Molecule workflow also runs weekly, so drift in the `:latest` test images surfaces on its own build rather than on an unrelated pull request.
 
 ## [Initial]
 

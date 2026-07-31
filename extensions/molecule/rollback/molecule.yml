@@ -3,8 +3,13 @@
 driver:
   name: docker
 platforms:
-  - name: ssh-key-rotation-rollback-ubuntu2204
+  # The first platform carries the settings every platform shares; the rest merge it and
+  # override only name/image. The Dockerfile itself is shared across scenarios too, hence the
+  # relative path (the docker driver resolves `dockerfile` against this scenario directory).
+  - &platform_defaults
+    name: ssh-key-rotation-rollback-ubuntu2204
     image: geerlingguy/docker-ubuntu2204-ansible:latest
+    dockerfile: ../resources/Dockerfile.j2
     command: /usr/sbin/init
     privileged: true
     cgroupns_mode: host
@@ -16,43 +21,31 @@ platforms:
       - /sys/fs/cgroup:/sys/fs/cgroup:rw
     groups:
       - rotate
-  - name: ssh-key-rotation-rollback-rockylinux9
+  - <<: *platform_defaults
+    name: ssh-key-rotation-rollback-rockylinux9
     image: geerlingguy/docker-rockylinux9-ansible:latest
-    command: /usr/sbin/init
-    privileged: true
-    cgroupns_mode: host
-    pre_build_image: false
-    tmpfs:
-      - /run
-      - /run/lock
-    volumes:
-      - /sys/fs/cgroup:/sys/fs/cgroup:rw
-    groups:
-      - rotate
-  - name: ssh-key-rotation-rollback-rockylinux10
+  - <<: *platform_defaults
+    name: ssh-key-rotation-rollback-rockylinux10
     image: geerlingguy/docker-rockylinux10-ansible:latest
-    command: /usr/sbin/init
-    privileged: true
-    cgroupns_mode: host
-    pre_build_image: false
-    tmpfs:
-      - /run
-      - /run/lock
-    volumes:
-      - /sys/fs/cgroup:/sys/fs/cgroup:rw
-    groups:
-      - rotate
+dependency:
+  # Mirrors exactly what CI used to run as a separate step, so a local `molecule test` and a
+  # CI run install the same collection dependencies. Molecule chdirs to the project directory
+  # (the collection root) before running a sequence, so this relative path is correct.
+  name: shell
+  command: ansible-galaxy install -r requirements.yml
 provisioner:
   name: ansible
-  env:
-    ANSIBLE_ROLES_PATH: "../../../roles"
+  # Deliberately no ANSIBLE_ROLES_PATH here. Molecule runs with the project directory as its
+  # cwd, not the scenario directory, so a scenario-relative value resolves outside the repo and,
+  # worse, overrides the roles_path in the collection's own ansible.cfg - which is what makes the
+  # bare `ssh_key_rotation` role name in converge.yml resolve at all.
   inventory:
     group_vars:
       # The docker connection plugin doesn't invoke a login shell, so `~` in the default
       # remote_tmp path doesn't reliably expand for the "rotate" containers. Pin it to the
-      # absolute path molecule-entrypoint.sh already pre-creates for root before systemd
-      # starts. Scoped to this group only - localhost (used by molecule's own internal
-      # playbooks and the key-generation play) must keep its normal, non-root remote_tmp.
+      # absolute path resources/Dockerfile.j2 already creates for root in the image. Scoped to
+      # this group only - localhost (used by molecule's own internal playbooks and the
+      # key-generation play) must keep its normal, non-root remote_tmp.
       rotate:
         ansible_remote_tmp: /root/.ansible/tmp
         # These containers are entered as root. Saying so explicitly means Ansible skips
@@ -64,6 +57,11 @@ provisioner:
         ansible_user: root
 scenario:
   test_sequence:
+    - dependency
+    # Leading destroy: without it a container left behind by an aborted run is reused, and its
+    # authorized_keys already holds keys from that run. That silently breaks this suite's core
+    # premise (only the seeded key is authorized before converge runs).
+    - destroy
     - syntax
     - create
     - prepare

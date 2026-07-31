@@ -24,6 +24,7 @@ venv/
 .ansible/
 ansible_collections/
 inventory.ini
+.mcp*
 
 # SSH key material - QUICKSTART.md has users generate keys in this directory;
 # never commit private keys. Public keys (*.pub) are safe and stay tracked.

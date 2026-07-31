@@ -7,6 +7,11 @@ on:
     branches: [main, devel]
   pull_request:
     branches: [main, devel]
+  # The test platforms track the geerlingguy images by :latest, so the base images move
+  # underneath this suite between commits. A weekly run means that drift surfaces as its own
+  # red build rather than as a mystery failure on whatever unrelated PR is open at the time.
+  schedule:
+    - cron: "0 6 * * 1"
   workflow_dispatch:
 
 jobs:
@@ -30,9 +35,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install "ansible>=2.18" "molecule>=25.0" "molecule-plugins[docker]"
 
-      - name: Install collection dependencies
-        run: ansible-galaxy install -r requirements.yml
-
+      # No separate ansible-galaxy step: the scenarios run `dependency` as the first step of
+      # their test sequence, so collection dependencies get installed the same way here and on
+      # a developer's machine.
       - name: Run Molecule scenario
         run: molecule test -s ${{ matrix.scenario }}
         env:
