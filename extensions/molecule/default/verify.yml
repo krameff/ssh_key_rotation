@@ -3,14 +3,19 @@
 # Confirms the rotation actually did what it claims: the new key authenticates, the old key
 # is rejected, authorized_keys/sshd_config reflect the role's (default) settings.
 
-- name: Verify | Confirm rotation results via the NEW key
+- name: Verify | Inspect the post-rotation state on each container
   hosts: rotate
   gather_facts: false
   vars:
     ssh_key_rotation_test_dir: "{{ lookup('env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}"
-    ansible_ssh_private_key_file: "{{ ssh_key_rotation_test_dir }}/new_key"
   tasks:
-    - name: Verify | New key authenticates
+    # Deliberately NOT presented as a key-authentication check. This play reaches the
+    # containers over ansible_connection=community.docker.docker, which ignores
+    # ansible_ssh_private_key_file entirely, so a ping here returns "pong" no matter which key
+    # (or no key) is supplied and can prove nothing about SSH auth. That proof is the second
+    # play below, which drives a real ssh client. This is only a liveness check for the file
+    # inspection that follows.
+    - name: Verify | Container is reachable for inspection
       ansible.builtin.ping:
 
     - name: Verify | Read authorized_keys

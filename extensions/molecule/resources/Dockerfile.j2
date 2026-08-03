@@ -1,8 +1,8 @@
 # Molecule managed
 #
-# Wraps the upstream geerlingguy image (already has python/ansible prereqs) with an
-# entrypoint that pre-creates root's ansible remote_tmp dir before systemd starts, so the
-# first ansible task never races container/systemd boot for that mkdir.
+# Shared by every scenario (referenced with `dockerfile: ../resources/Dockerfile.j2` on each
+# platform). Wraps the upstream geerlingguy image, which already ships the python/ansible
+# prerequisites, with the two things these tests need on top of it.
 FROM {{ item.image }}
 
 # These test images don't ship openssh-server. Install it at build time (not via an Ansible
@@ -28,7 +28,10 @@ RUN dnf install -y openssh-server \
 RUN chmod 0400 /etc/shadow
 {% endif %}
 
-COPY molecule-entrypoint.sh /usr/local/bin/molecule-entrypoint.sh
-RUN chmod +x /usr/local/bin/molecule-entrypoint.sh
-
-ENTRYPOINT ["/usr/local/bin/molecule-entrypoint.sh"]
+# Pre-create root's ansible remote_tmp directory, the absolute path that molecule.yml pins
+# ansible_remote_tmp to for the "rotate" group. Doing it in the image (rather than from an
+# entrypoint wrapper or a prepare task) means the directory exists before the container is
+# ever started, so nothing at runtime can race the first Ansible connection's own mkdir of
+# the same path. /root is neither a tmpfs nor a volume in these platforms, so the layer
+# survives into the running container.
+RUN install -d -m 0700 /root/.ansible/tmp

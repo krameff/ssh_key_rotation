@@ -6,9 +6,13 @@
 
 - name: Verify | Confirm key_a still authenticates after the failed/rolled-back rotation
   hosts: rotate
-  gather_facts: false
+  # Facts are needed for the family-specific sshd unit name below.
+  gather_facts: true
   vars:
     ssh_key_rotation_test_dir: "{{ lookup('env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}"
+    # Same lookup prepare.yml uses: Debian/Ubuntu: ssh, RedHat/Rocky: sshd. Hardcoding "sshd"
+    # here only worked on Ubuntu by accident, via ssh.service's sshd.service alias.
+    ssh_key_rotation_sshd_service: "{{ 'sshd' if ansible_facts['os_family'] == 'RedHat' else 'ssh' }}"
     ssh_key_rotation_verify_ssh_opts: >-
       -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
       -o IdentitiesOnly=yes -o ConnectTimeout=15
@@ -31,7 +35,7 @@
       changed_when: false
 
     - name: Verify | sshd is running
-      ansible.builtin.command: systemctl is-active sshd
+      ansible.builtin.command: "systemctl is-active {{ ssh_key_rotation_sshd_service }}"
       become: true
       changed_when: false
 
