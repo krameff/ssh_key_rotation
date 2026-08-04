@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- Release workflow: tagging `v*` builds the collection and publishes it to Galaxy, needs a `GALAXY_API_KEY` secret.
+- Release workflow fails the build if the tag doesn't match the version in `galaxy.yml`.
+
 ### Fixed
 
 - Verify stage rollback no longer aborts if the sshd reload fails - it finishes restoring, re-confirms connectivity, and reports that sshd needs a manual reload.
@@ -23,6 +28,12 @@
 - Molecule platform definitions use a YAML anchor rather than repeating three near-identical blocks per scenario.
 - Molecule test sequences start with `dependency` and `destroy`: collection dependencies are installed the same way locally and in CI (the workflow's separate `ansible-galaxy` step is gone), and a container left behind by an aborted run can no longer be reused with keys already in its `authorized_keys`.
 - The Molecule workflow also runs weekly, so drift in the `:latest` test images surfaces on its own build rather than on an unrelated pull request.
+- `build_ignore` still pointed at `molecule/`, so the scenarios were being shipped in the artifact; it now excludes `extensions/molecule` plus `.github`, `.claude`, `.cursor`, `.ansible`, `.mcp.json` and `inventory.ini`.
+- `DEVELOPMENT.md` shows how to generate throwaway keys outside the repo for manual testing.
+
+### Removed
+
+- Root-level test keypairs and `test_vars.yml` - local scratch files nothing depended on.
 
 ## [Initial]
 

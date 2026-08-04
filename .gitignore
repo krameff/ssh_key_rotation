@@ -39,3 +39,7 @@ pwc_id_*
 *.pem
 authorized_keys.bak-*
 test_vars.yml
+test_*
+*_ecdsa*
+*_ed25519*
+!*.pub.example

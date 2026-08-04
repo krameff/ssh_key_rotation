@@ -151,11 +151,24 @@ molecule test -s rollback
 ```
 
 Both scenarios generate their own ephemeral SSH keypairs and inventory into Molecule's
-per-run ephemeral directory - they do not use the root-level `test_vars.yml` or
-`test_rsa*`/`test_ecdsa*`/`test_ed25519` files. Those root-level files are for local,
-manual testing only (e.g. `ansible-playbook -i inventory.ini playbooks/rotate.yml -e
-@test_vars.yml`); edit `test_vars.yml`'s paths for your own machine before using it, since
-the checked-in paths are just examples.
+per-run ephemeral directory, so nothing needs to exist in the repository for them to run.
+
+For local manual testing, generate your own throwaway keypairs outside the repository and
+point the playbook at them:
+
+```bash
+ssh-keygen -t rsa -b 4096 -N "" -f /tmp/rotation-old
+ssh-keygen -t ed25519 -N "" -f /tmp/rotation-new
+
+ansible-playbook -i inventory.ini playbooks/rotate.yml \
+  -e old_private_key=/tmp/rotation-old \
+  -e old_public_key_file=/tmp/rotation-old.pub \
+  -e new_private_key=/tmp/rotation-new \
+  -e new_public_key_file=/tmp/rotation-new.pub
+```
+
+Keep generated keys out of the working tree. `.gitignore` covers the common patterns, but
+a private key that lands in a commit has to be treated as compromised regardless.
 
 ## Building and Publishing
 

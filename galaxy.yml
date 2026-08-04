@@ -20,11 +20,13 @@ tags:
 dependencies:
   ansible.posix: ">=1.3.0"
 build_ignore:
-  - molecule
-  - test_vars.yml
-  - test_rsa
-  - test_rsa.pub
-  - test_ecdsa
-  - test_ecdsa.pub
-  - test_ed25519
-  - test_ed25519.pub
+  - extensions/molecule
+  - .github
+  - .claude
+  - .cursor
+  - .ansible
+  - .mcp.json
+  - inventory.ini
+  # Belt and braces: these are gitignored and should never exist in a clean checkout, but a
+  # build run from a developer's working tree must not pick up local key material.
+  - test_*
