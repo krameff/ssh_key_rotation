@@ -1,51 +1,88 @@
+<p align="center">
+  <img src="images/ssh-key-rotation-lockup-light.svg#gh-light-mode-only" width="420">
+  <img src="images/ssh-key-rotation-lockup-dark.svg#gh-dark-mode-only" width="420">
+</p>
+
 # SSH Key Rotation Collection
 
-A production-safe Ansible collection for rotating SSH keys across your infrastructure without breaking existing connections.
+An Ansible collection for rotating SSH keys across your infrastructure without breaking existing connections.
 
-> **Warning:** as with anything you download, test this thoroughly against a disposable or non-critical host (a VM snapshot you can roll back is ideal) before running it anywhere that matters. This collection is built with multiple safety gates (see [Safety model](#safety-model)), but no automated tool can guarantee it fits every environment, and SSH lockouts can be genuinely painful to recover from.
+> **Warning**
+>
+> As with anything you download, test this thoroughly against a disposable host before running it anywhere that matters. A VM snapshot you can roll back is ideal.
+>
+> The collection is built with multiple safety gates (see [Safety model](#safety-model)), but no automated tool can guarantee it fits every environment, and SSH lockouts are painful to recover from.
 
-## Overview
+## Contents
 
-Rotating SSH keys is one of those jobs that's easy to get wrong in a way that locks you out of a server. This collection handles it as a three-phase process, specifically so that a mistake at any point fails safely instead of leaving a host unreachable:
+- [How it works](#how-it-works)
+- [Features](#features)
+- [Requirements](#requirements)
+- [Tested platforms](#tested-platforms)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Variables](#variables)
+- [Key validation](#key-validation)
+- [PQC algorithm negotiation](#pqc-algorithm-negotiation)
+- [Safety model](#safety-model)
+- [What each phase does](#what-each-phase-does)
+- [Role reference](#role-reference)
+- [Troubleshooting](#troubleshooting)
+- [Development](#development)
 
-0. **Phase 0** - Validate everything locally, before touching a single host: required variables are set, the new key is a recognized and strong type, and the new private key actually matches the public key file.
-1. **Phase 1** - Connect with the old key, install the new key alongside it, and make sure public key authentication is enabled.
-2. **Phase 2** - Reconnect using the *new* key to prove it actually works, then (and only then) remove the old key and disable legacy auth methods.
+## How it works
 
-The old key is never touched until the new one has proven it can authenticate. If Phase 2 can't connect with the new key, the playbook stops right there - it won't go on to edit `authorized_keys` or `sshd_config` any further on that host. Every `sshd_config` change is checked with `sshd -t` before it's written, and both `sshd_config` and `authorized_keys` are backed up first, so a bad change can always be reverted by hand afterwards.
+Rotating SSH keys is easy to get wrong in a way that locks you out of a server. This collection splits the job into three phases so that a mistake at any point fails safely instead of leaving a host unreachable.
+
+**Phase 0: validate.** Runs entirely on the control node, before touching a single host. Checks that the required variables are set, that the new key is a recognised and strong type, and that the new private key really matches the public key file.
+
+**Phase 1: install.** Connects with the old key, installs the new key alongside it, and makes sure public key authentication is enabled.
+
+**Phase 2: verify.** Reconnects using the *new* key to prove it works. Only then does it remove the old key and disable legacy auth methods.
+
+The old key is never touched until the new one has proven it can authenticate. If Phase 2 cannot connect with the new key, the playbook stops there and makes no further edits to `authorized_keys` or `sshd_config` on that host.
+
+Every `sshd_config` change is checked with `sshd -t` before it is written, and both `sshd_config` and `authorized_keys` are backed up first, so a bad change can always be reverted by hand.
 
 ## Features
 
-- **Zero-downtime** - uses an `sshd` reload rather than a restart, so existing SSH sessions survive the configuration change
-- **Key recognition checks** - rejects deprecated or weak key types and undersized RSA keys before rotating anything (see [Key Validation](#key-validation-pqc-readiness))
-- **Hard safety gate** - the new key must authenticate before the old one is removed
-- **Cross-OS support** - handles the Debian/Ubuntu vs RHEL/CentOS `sshd` service-name difference for you
-- **Drop-in and `Match` block awareness** - warns if `/etc/ssh/sshd_config.d/` files or `Match` blocks might silently override what this playbook is setting
-- **Flexible auth policy** - optionally make the new key exclusive, and optionally disable password/keyboard-interactive auth
-- **Validated, backed-up config edits** - every `sshd` change is checked with `sshd -t` and backed up before it's written
-- **PQC algorithm negotiation (opt-in)** - can also enable post-quantum/hybrid key exchange and signature algorithms across `sshd_config`, RHEL/Fedora crypto-policy, and the control node's own ssh client (see [PQC Algorithm Negotiation](#pqc-algorithm-negotiation))
+**Zero downtime.** Configuration is applied with an `sshd` reload rather than a restart, so existing SSH sessions survive the change.
+
+**Key recognition checks.** Deprecated key types, weak key types and undersized RSA keys are rejected before anything is rotated. See [Key validation](#key-validation).
+
+**A hard safety gate.** The new key must authenticate before the old one is removed.
+
+**Cross-OS support.** The Debian/Ubuntu vs RHEL/CentOS `sshd` service-name difference is handled for you.
+
+**Drop-in and `Match` block awareness.** Warns if files in `/etc/ssh/sshd_config.d/` or `Match` blocks might silently override what the playbook is setting.
+
+**Flexible auth policy.** Optionally make the new key exclusive, and optionally disable password and keyboard-interactive auth.
+
+**Validated, backed-up config edits.** Every `sshd` change is checked with `sshd -t` and backed up before it is written.
+
+**Post-quantum negotiation, opt-in.** Can enable post-quantum and hybrid key exchange and signature algorithms across `sshd_config`, RHEL/Fedora crypto-policy, and the control node's own ssh client. See [PQC algorithm negotiation](#pqc-algorithm-negotiation).
 
 ## Requirements
 
-- **Ansible** ≥ 2.18
-- **ansible.posix** ≥ 1.3.0
+- Ansible 2.18 or later
+- `ansible.posix` 1.3.0 or later
 
-  ```bash
-  ansible-galaxy collection install ansible.posix
-  ```
+```bash
+ansible-galaxy collection install ansible.posix
+```
 
-## Tested Platforms
+## Tested platforms
 
-This collection targets Debian/Ubuntu and RHEL/Fedora-family targets generally, but these are the specific OS versions it's actually been run against, end to end, on real hosts:
+The collection targets Debian/Ubuntu and RHEL/Fedora-family hosts generally. These are the specific versions it has been run against end to end, on real hosts:
 
 | OS | Notes |
 |----|-------|
-| Ubuntu 22.04 LTS (Jammy Jellyfish) | Watch for `sshd_config.d/` drop-ins (e.g. cloud-init's `50-cloud-init.conf`) that can override settings this playbook writes further down `sshd_config` - see [Drop-in sshd config files found](#drop-in-sshd-config-files-found) |
-| AlmaLinux 9.8 (Olive Jaguar), `FIPS` crypto-policy | `FIPS` alone has no PQC key exchange; use `ssh_key_rotation_crypto_policy_add_modules: [PQ]` to add it (see [Combining a base policy with a subpolicy module](#combining-a-base-policy-with-a-subpolicy-module-basemodule)) |
-| AlmaLinux 10.2 (Lavender Lion), `FIPS` crypto-policy | `FIPS` already includes PQC key exchange by default here, no extra module needed |
-| openSUSE Leap 15.6 | Ships Python 3.6 by default, which is too old for Ansible ≥ 2.15's target-side requirements; set `ansible_python_interpreter` to a Python 3.7+ install (e.g. `python39` via `zypper`) |
+| Ubuntu 22.04 LTS (Jammy Jellyfish) | Watch for `sshd_config.d/` drop-ins such as cloud-init's `50-cloud-init.conf`, which can override settings written further down `sshd_config`. See [Drop-in sshd config files found](#drop-in-sshd-config-files-found). |
+| AlmaLinux 9.8 (Olive Jaguar), `FIPS` crypto-policy | `FIPS` on its own has no PQC key exchange. Use `ssh_key_rotation_crypto_policy_add_modules: [PQ]` to add it. See [Combining a base policy with a subpolicy module](#combining-a-base-policy-with-a-subpolicy-module). |
+| AlmaLinux 10.2 (Lavender Lion), `FIPS` crypto-policy | `FIPS` already includes PQC key exchange here. No extra module needed. |
+| openSUSE Leap 15.6 | Ships Python 3.6 by default, which is too old for Ansible 2.15+ on the target side. Set `ansible_python_interpreter` to a Python 3.7+ install, for example `python39` via `zypper`. |
 
-Other versions in the same OS families are likely to work too, since nothing here relies on version-specific behavior beyond what's called out above, but they haven't been explicitly verified.
+Other versions in the same families are likely to work, since nothing here relies on version-specific behaviour beyond what is called out above. They have not been explicitly verified.
 
 ## Installation
 
@@ -71,37 +108,16 @@ ansible-playbook krameff.ssh_key_rotation.rotate \
   --ask-become-pass
 ```
 
-### Required variables
+The playbook runs against the `rotate` host group, which you define in your inventory:
 
-| Variable | Type | Description |
-|----------|------|-------------|
-| `old_private_key` | string | Path to the old SSH private key (local) |
-| `new_private_key` | string | Path to the new SSH private key (local) |
-| `old_public_key_file` | string | Path to the old SSH public key (local) |
-| `new_public_key_file` | string | Path to the new SSH public key (local) |
+```ini
+[rotate]
+prod-web-01 ansible_host=10.0.1.10
+prod-web-02 ansible_host=10.0.1.11
+prod-db-01 ansible_host=10.0.2.10
+```
 
-### Optional variables
-
-| Variable | Type | Default | Description |
-|----------|------|---------|-------------|
-| `ansible_user` | string | $USER | Remote user to rotate keys for |
-| `ssh_key_rotation_disable_password_auth` | bool | true | Disable password authentication after rotation |
-| `ssh_key_rotation_disable_kbd_interactive` | bool | true | Disable keyboard-interactive auth after rotation |
-| `ssh_key_rotation_make_exclusive` | bool | false | Leave ONLY the new key in authorized_keys |
-| `ssh_key_rotation_accepted_key_types` | list | `[ED25519, ED25519-SK, ECDSA, ECDSA-SK, RSA]` | Key types allowed for `new_public_key_file` |
-| `ssh_key_rotation_pqc_key_types` | list | `[]` | Forward-compatible allowlist slot for post-quantum signature key types (see [Key Validation](#key-validation-pqc-readiness)) |
-| `ssh_key_rotation_reject_key_types` | list | `[DSA]` | Key types that always fail validation, regardless of `ssh_key_rotation_accepted_key_types` |
-| `ssh_key_rotation_min_rsa_bits` | int | `3072` | Minimum RSA key size accepted |
-| `ssh_key_rotation_pqc_kex_algorithms` | list | `[]` | PQC/hybrid key-exchange algorithm names (see [PQC Algorithm Negotiation](#pqc-algorithm-negotiation)) |
-| `ssh_key_rotation_pqc_pubkey_algorithms` | list | `[]` | PQC/hybrid signature algorithm names for `PubkeyAcceptedAlgorithms`/`HostKeyAlgorithms` |
-| `ssh_key_rotation_pqc_ca_signature_algorithms` | list | `[]` | PQC/hybrid algorithm names for `CASignatureAlgorithms` (SSH CA setups only) |
-| `ssh_key_rotation_manage_crypto_policy` | bool | `false` | Opt-in: manage RHEL/Fedora system-wide crypto-policy on the control node and targets |
-| `ssh_key_rotation_crypto_policy_setting` | string | `DEFAULT:PQ` | Value passed to `update-crypto-policies --set` when `ssh_key_rotation_manage_crypto_policy` is true |
-| `ssh_key_rotation_crypto_policy_add_modules` | list | `[]` | Adds module(s) (e.g. `PQ`) onto whatever policy a host already has, instead of replacing it (see [Combining a base policy with a subpolicy module](#combining-a-base-policy-with-a-subpolicy-module-basemodule)) |
-
-### Advanced examples
-
-#### Disable password auth but keep keyboard-interactive
+### Disable password auth but keep keyboard-interactive
 
 ```bash
 ansible-playbook krameff.ssh_key_rotation.rotate \
@@ -114,7 +130,7 @@ ansible-playbook krameff.ssh_key_rotation.rotate \
   -e ssh_key_rotation_disable_kbd_interactive=false
 ```
 
-#### Keep multiple keys (don't make exclusive)
+### Keep the old key in place as well as the new one
 
 ```bash
 ansible-playbook krameff.ssh_key_rotation.rotate \
@@ -127,38 +143,87 @@ ansible-playbook krameff.ssh_key_rotation.rotate \
   -e ssh_key_rotation_disable_password_auth=true
 ```
 
-## Key Validation (PQC readiness)
+## Variables
 
-Before any host is touched, Phase 0 runs entirely on the control node and checks:
+### Required
 
-1. All four required variables are set (fails fast with a clear message instead of a deep "undefined variable" error)
-2. `new_public_key_file`'s type (via `ssh-keygen -l`) is not in `ssh_key_rotation_reject_key_types` (e.g. `ssh-dss`/DSA)
-3. Its type is in `ssh_key_rotation_accepted_key_types` **or** `ssh_key_rotation_pqc_key_types`
-4. If it's an RSA key, it meets `ssh_key_rotation_min_rsa_bits`
-5. `new_private_key` and `new_public_key_file` are actually a matching pair (fingerprints must agree) - this catches the common mistake of pointing at mismatched key files
+| Variable | Type | Description |
+|----------|------|-------------|
+| `old_private_key` | string | Path to the old SSH private key, on the control node |
+| `new_private_key` | string | Path to the new SSH private key, on the control node |
+| `old_public_key_file` | string | Path to the old SSH public key, on the control node |
+| `new_public_key_file` | string | Path to the new SSH public key, on the control node |
 
-**On post-quantum cryptography:** mainline OpenSSH doesn't yet ship a post-quantum *signature* algorithm for `authorized_keys`/host keys, only post-quantum *key exchange* for the transport layer (`mlkem768x25519-sha256`, `sntrup761x25519-sha512`); see [openssh.org/pq.html](https://www.openssh.org/pq.html). So there isn't a standard "PQC key" to check for yet. `ssh_key_rotation_pqc_key_types` exists as a forward-compatible allowlist: once OpenSSH (or an [OQS-OpenSSH](https://github.com/open-quantum-safe/openssh) build) reports a PQC signature type such as `MLDSA65` or `FALCON1024` from `ssh-keygen -l`, just add that name to `ssh_key_rotation_pqc_key_types` (via `-e` or by editing `roles/ssh_key_rotation/defaults/main.yml`) and it'll be accepted, no other playbook change required.
+### Optional
 
-Phase 1 also does a hard check after reloading `sshd`: it runs `sshd -T` on the target, extracts the effective `PubkeyAcceptedAlgorithms` list, and **fails the host** if none of the new key type's real signature algorithms (e.g. `ssh-ed25519` for an ED25519 key) are in it. This matters because a system-wide crypto-policy can silently narrow what the *type check* in Phase 0 would otherwise accept - for example, RHEL/Fedora's `FIPS` policy drops `ssh-ed25519` entirely and only allows `ecdsa-sha2-*`/`rsa-sha2-*`. Without this check, Phase 1 would report success, and Phase 2 would go on to remove the old key anyway, leaving the host with no key it can actually authenticate with. The check runs, and can fail the host, *before* Phase 2 does anything destructive.
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `ansible_user` | string | `$USER` | Remote user to rotate keys for |
+| `ssh_key_rotation_disable_password_auth` | bool | `true` | Disable password authentication after rotation |
+| `ssh_key_rotation_disable_kbd_interactive` | bool | `true` | Disable keyboard-interactive auth after rotation |
+| `ssh_key_rotation_make_exclusive` | bool | `false` | Leave only the new key in `authorized_keys` |
+| `ssh_key_rotation_accepted_key_types` | list | `[ED25519, ED25519-SK, ECDSA, ECDSA-SK, RSA]` | Key types allowed for `new_public_key_file` |
+| `ssh_key_rotation_reject_key_types` | list | `[DSA]` | Key types that always fail validation, whatever the accepted list says |
+| `ssh_key_rotation_min_rsa_bits` | int | `3072` | Minimum RSA key size accepted |
+| `ssh_key_rotation_pqc_key_types` | list | `[]` | Forward-compatible allowlist for post-quantum signature key types. See [Key validation](#key-validation). |
 
-## PQC Algorithm Negotiation
+### Optional, post-quantum
 
-`ssh_key_rotation_pqc_key_types` above only affects local key *type* recognition in Phase 0 - it never changes what `sshd`/`ssh` actually negotiate on the wire. For a PQC or hybrid key to actually work end to end, both sides of the connection need matching algorithm lists across several independent layers, and this collection can manage all of them. Everything here is opt-in, and empty/false by default, so none of it changes existing behaviour unless you ask for it:
+All of these are empty or false by default, so none of them change existing behaviour unless you ask for them. See [PQC algorithm negotiation](#pqc-algorithm-negotiation).
 
-| Variable | Affects |
-|----------|---------|
-| `ssh_key_rotation_pqc_kex_algorithms` | `KexAlgorithms` in the target's `sshd_config`, and `-o KexAlgorithms` for this playbook's own ssh connections |
-| `ssh_key_rotation_pqc_pubkey_algorithms` | `PubkeyAcceptedAlgorithms`/`HostKeyAlgorithms` in the target's `sshd_config`, and `-o PubkeyAcceptedAlgorithms` for this playbook's own ssh connections |
-| `ssh_key_rotation_pqc_ca_signature_algorithms` | `CASignatureAlgorithms` in the target's `sshd_config` (SSH CA setups only) |
-| `ssh_key_rotation_manage_crypto_policy` | Also manage RHEL/Fedora system-wide crypto-policy, on the control node and on targets |
-| `ssh_key_rotation_crypto_policy_setting` | Value passed to `update-crypto-policies --set`, optionally combining a base policy with one or more subpolicy modules via `BASE:MODULE` syntax (e.g. `DEFAULT:PQ`, `FIPS:PQ`) |
-| `ssh_key_rotation_crypto_policy_add_modules` | Preferred over `ssh_key_rotation_crypto_policy_setting`: adds module(s) onto a host's current policy instead of replacing it |
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `ssh_key_rotation_pqc_kex_algorithms` | list | `[]` | PQC or hybrid key-exchange algorithm names |
+| `ssh_key_rotation_pqc_pubkey_algorithms` | list | `[]` | PQC or hybrid signature algorithm names for `PubkeyAcceptedAlgorithms` and `HostKeyAlgorithms` |
+| `ssh_key_rotation_pqc_ca_signature_algorithms` | list | `[]` | PQC or hybrid algorithm names for `CASignatureAlgorithms`, for SSH CA setups only |
+| `ssh_key_rotation_manage_crypto_policy` | bool | `false` | Manage the RHEL/Fedora system-wide crypto-policy on the control node and targets |
+| `ssh_key_rotation_crypto_policy_setting` | string | `DEFAULT:PQ` | Value passed to `update-crypto-policies --set` |
+| `ssh_key_rotation_crypto_policy_add_modules` | list | `[]` | Adds modules such as `PQ` onto whatever policy a host already has, instead of replacing it |
 
-Every `sshd_config` directive is written using OpenSSH's `+algorithm` syntax, appending to the compiled-in defaults rather than replacing the list outright, so clients that don't speak PQC yet can still fall back to a classical algorithm.
+## Key validation
 
-### Where each piece lives
+Before any host is touched, Phase 0 runs on the control node and checks that:
 
-Split by which stage actually runs each step, and on which machine (see [Role Reference](#role-reference) for how these map to `tasks/*.yml`):
+1. All four required variables are set. This fails fast with a clear message rather than a deep "undefined variable" error.
+2. The type of `new_public_key_file`, read via `ssh-keygen -l`, is not in `ssh_key_rotation_reject_key_types`, for example `ssh-dss`/DSA.
+3. That type is in `ssh_key_rotation_accepted_key_types` or `ssh_key_rotation_pqc_key_types`.
+4. If it is an RSA key, it meets `ssh_key_rotation_min_rsa_bits`.
+5. `new_private_key` and `new_public_key_file` are genuinely a matching pair, by comparing fingerprints. This catches the common mistake of pointing at mismatched key files.
+
+### A note on post-quantum keys
+
+Mainline OpenSSH does not yet ship a post-quantum *signature* algorithm for `authorized_keys` or host keys. It only ships post-quantum *key exchange* for the transport layer, namely `mlkem768x25519-sha256` and `sntrup761x25519-sha512`. See [openssh.org/pq.html](https://www.openssh.org/pq.html).
+
+So there is no standard "PQC key" to check for yet. `ssh_key_rotation_pqc_key_types` exists as a forward-compatible allowlist. Once OpenSSH, or an [OQS-OpenSSH](https://github.com/open-quantum-safe/openssh) build, reports a PQC signature type such as `MLDSA65` or `FALCON1024` from `ssh-keygen -l`, add that name to `ssh_key_rotation_pqc_key_types` and it will be accepted. No other change is needed.
+
+### The Phase 1 algorithm check
+
+After reloading `sshd`, Phase 1 runs `sshd -T` on the target, extracts the effective `PubkeyAcceptedAlgorithms` list, and fails the host if none of the new key type's real signature algorithms are in it. For an ED25519 key, that means looking for `ssh-ed25519`.
+
+This matters because a system-wide crypto-policy can quietly narrow what the Phase 0 type check would otherwise accept. RHEL and Fedora's `FIPS` policy, for instance, drops `ssh-ed25519` entirely and allows only `ecdsa-sha2-*` and `rsa-sha2-*`.
+
+Without this check, Phase 1 would report success and Phase 2 would go on to remove the old key, leaving the host with no key it can actually authenticate with. The check runs, and can fail the host, before Phase 2 does anything destructive.
+
+## PQC algorithm negotiation
+
+`ssh_key_rotation_pqc_key_types` only affects local key *type* recognition in Phase 0. It never changes what `sshd` and `ssh` actually negotiate on the wire.
+
+For a PQC or hybrid key to work end to end, both sides of the connection need matching algorithm lists across several independent layers. This collection can manage all of them:
+
+| Variable | What it affects |
+|----------|-----------------|
+| `ssh_key_rotation_pqc_kex_algorithms` | `KexAlgorithms` in the target's `sshd_config`, and `-o KexAlgorithms` for this playbook's own connections |
+| `ssh_key_rotation_pqc_pubkey_algorithms` | `PubkeyAcceptedAlgorithms` and `HostKeyAlgorithms` in the target's `sshd_config`, and `-o PubkeyAcceptedAlgorithms` for this playbook's own connections |
+| `ssh_key_rotation_pqc_ca_signature_algorithms` | `CASignatureAlgorithms` in the target's `sshd_config`, for SSH CA setups only |
+| `ssh_key_rotation_manage_crypto_policy` | Whether the RHEL/Fedora system-wide crypto-policy is also managed, on the control node and on targets |
+| `ssh_key_rotation_crypto_policy_setting` | The value passed to `update-crypto-policies --set`, optionally combining a base policy with subpolicy modules using `BASE:MODULE` syntax, such as `DEFAULT:PQ` or `FIPS:PQ` |
+| `ssh_key_rotation_crypto_policy_add_modules` | Preferred over the setting above: adds modules onto a host's current policy instead of replacing it |
+
+Every `sshd_config` directive is written with OpenSSH's `+algorithm` syntax, appending to the compiled-in defaults rather than replacing the list outright, so clients that do not speak PQC yet can still fall back to a classical algorithm.
+
+### Where each piece runs
+
+The diagram below splits the work by stage and by machine. See [Role reference](#role-reference) for how these map to `tasks/*.yml`.
 
 ```mermaid
 flowchart TD
@@ -203,21 +268,25 @@ flowchart TD
     EffectiveCheck --> Reconnect
 ```
 
-It starts on the control node, in Phase 0: `ssh -Q kex` and `ssh -Q key-sig` confirm your own ssh binary can actually offer the algorithms you're asking for, before any host is touched. If `ssh_key_rotation_manage_crypto_policy` is set and this happens to be a RHEL/Fedora control node, it also runs `update-crypto-policies --set` there, so the machine's ssh *client* backend permits PQC algorithms system-wide - this is detected by checking whether the `update-crypto-policies` tool exists, not by an OS-family fact.
+**On the control node, in Phase 0.** `ssh -Q kex` and `ssh -Q key-sig` confirm your own ssh binary can offer the algorithms you are asking for, before any host is touched. If `ssh_key_rotation_manage_crypto_policy` is set and this is a RHEL or Fedora control node, `update-crypto-policies --set` runs there too, so the machine's ssh *client* backend permits PQC algorithms system-wide. This is detected by checking whether the `update-crypto-policies` tool exists, not by an OS-family fact.
 
-From there, the algorithms need to travel with the Ansible connection itself. Rather than editing any file on the control node, Phase 1 and Phase 2 compute an `ansible_ssh_extra_args` value that passes `-o KexAlgorithms=+...` and `-o PubkeyAcceptedAlgorithms=+...` for this playbook's own connections only.
+**On the connection itself.** The algorithms need to travel with the Ansible connection. Rather than editing any file on the control node, Phases 1 and 2 compute an `ansible_ssh_extra_args` value that passes `-o KexAlgorithms=+...` and `-o PubkeyAcceptedAlgorithms=+...` for this playbook's connections only.
 
-On the target side, Phase 1 appends `KexAlgorithms`, `PubkeyAcceptedAlgorithms`, `HostKeyAlgorithms`, and `CASignatureAlgorithms` to `sshd_config`, using the same `lineinfile` plus `sshd -t` validation plus backup pattern used everywhere else in this playbook. If `ssh_key_rotation_manage_crypto_policy` is also set and the target has the tooling for it, the same RHEL/Fedora crypto-policy step runs there too - and because `update-crypto-policies --set` only validates its own module syntax (not the resulting merged `sshd_config`), there's an explicit `sshd -t` re-check afterwards, before the reload handler is allowed to fire. The existing drop-in warning also now calls out `50-redhat.conf` by name, since that file is the generated crypto-policy backend include and isn't meant to be hand-edited.
+**On the target, in Phase 1.** `KexAlgorithms`, `PubkeyAcceptedAlgorithms`, `HostKeyAlgorithms` and `CASignatureAlgorithms` are appended to `sshd_config`, using the same `lineinfile` plus `sshd -t` plus backup pattern used everywhere else.
 
-#### Combining a base policy with a subpolicy module (`BASE:MODULE`)
+If `ssh_key_rotation_manage_crypto_policy` is set and the target has the tooling, the crypto-policy step runs there too. Because `update-crypto-policies --set` validates only its own module syntax and not the resulting merged `sshd_config`, there is an explicit `sshd -t` re-check afterwards, before the reload handler is allowed to fire. The drop-in warning also calls out `50-redhat.conf` by name, since that file is the generated crypto-policy backend include and is not meant to be hand-edited.
 
-`update-crypto-policies --set` accepts a base policy name on its own (`DEFAULT`, `FIPS`, `LEGACY`, ...) or a base policy combined with one or more subpolicy *modules*, written as `BASE:MODULE` (e.g. `FIPS:PQ`, or `FIPS:PQ:NO-SHA1` to stack more than one). Each module is a `MODULE.pmod` file, either shipped by the OS under `/usr/share/crypto-policies/policies/modules/` or dropped in locally under `/etc/crypto-policies/policies/modules/`, and it's *added on top of* the base policy rather than replacing it - so `FIPS:PQ` stays FIPS-compliant everywhere else and only adds what `PQ.pmod` grants.
+Once `sshd` has reloaded, the `sshd -T` check flags any requested algorithm that still is not showing up in the effective config, so you find out before Phase 2 tries and fails to reconnect.
 
-This matters specifically for PQC: on AlmaLinux/RHEL 9, the `FIPS` policy alone does not include any post-quantum key-exchange groups, but the OS still ships a built-in `PQ.pmod` module that adds `mlkem768x25519-sha256` (and other ML-KEM groups) when combined as `FIPS:PQ` - confirmed against a real AlmaLinux 9.8 host, where `sshd -T` only showed `mlkem768x25519-sha256` in the effective `KexAlgorithms` *after* switching from `FIPS` to `FIPS:PQ`. AlmaLinux/RHEL 10's `FIPS` policy ships with PQC key exchange already included, so this combination isn't needed there.
+### Combining a base policy with a subpolicy module
 
-Before ever calling `update-crypto-policies --set`, this playbook lists whatever `*.pmod` files actually exist under both module directories on that host (control node in Phase 0, target in Phase 1) and, if `ssh_key_rotation_crypto_policy_setting` names a module, **fails before making any change** if that module isn't present - rather than letting `update-crypto-policies` silently ignore an unknown module name or fail in a way that's easy to miss in the task output.
+`update-crypto-policies --set` accepts either a base policy name on its own (`DEFAULT`, `FIPS`, `LEGACY` and so on) or a base policy combined with one or more subpolicy *modules*, written as `BASE:MODULE`. For example `FIPS:PQ`, or `FIPS:PQ:NO-SHA1` to stack more than one.
 
-Finally, once `sshd` has reloaded, the existing `sshd -T` check is extended to flag any requested algorithm that still isn't showing up in the effective config, so you find out before Phase 2 tries (and fails) to reconnect.
+Each module is a `MODULE.pmod` file, either shipped by the OS under `/usr/share/crypto-policies/policies/modules/` or dropped in locally under `/etc/crypto-policies/policies/modules/`. A module is added on top of the base policy rather than replacing it, so `FIPS:PQ` stays FIPS-compliant everywhere else and only adds what `PQ.pmod` grants.
+
+This matters specifically for PQC. On AlmaLinux and RHEL 9, the `FIPS` policy alone includes no post-quantum key-exchange groups, but the OS still ships a built-in `PQ.pmod` that adds `mlkem768x25519-sha256` and other ML-KEM groups when combined as `FIPS:PQ`. This was confirmed against a real AlmaLinux 9.8 host, where `sshd -T` only showed `mlkem768x25519-sha256` in the effective `KexAlgorithms` after switching from `FIPS` to `FIPS:PQ`. AlmaLinux and RHEL 10 ship PQC key exchange in `FIPS` already, so the combination is not needed there.
+
+Before ever calling `update-crypto-policies --set`, the playbook lists whatever `*.pmod` files exist under both module directories on that host, the control node in Phase 0 and the target in Phase 1. If `ssh_key_rotation_crypto_policy_setting` names a module that is not present, it fails before making any change, rather than letting `update-crypto-policies` silently ignore an unknown module name or fail in a way that is easy to miss in the task output.
 
 ### Example: enabling a PQC key-exchange algorithm
 
@@ -257,69 +326,79 @@ ansible-playbook krameff.ssh_key_rotation.rotate \
   -e ssh_key_rotation_crypto_policy_setting=FIPS:PQ
 ```
 
-## How It Works
+## Safety model
 
-### Safety model
+The point of this playbook is that you should not be able to lock yourself out by running it. That comes down to a handful of rules it never breaks.
 
-The whole point of this playbook is that you should never be able to lock yourself out by running it. That comes down to a few rules it never breaks:
+**Nothing touches a live host until the new key has passed local checks.** Phase 0 verifies the new key's type, its strength, and that it genuinely pairs with the private key you gave it.
 
-- Nothing is validated against a live host until Phase 0 has already checked the new key locally - its type, its strength, and that it genuinely pairs with the private key you gave it.
-- Phase 1 confirms the target's *actual* effective `PubkeyAcceptedAlgorithms` (via `sshd -T`, after any crypto-policy is applied) includes a real signature algorithm for the new key's type, and fails the host before Phase 2 runs if it doesn't. A key type can pass Phase 0's local checks and still be rejected by a target's crypto-policy (RHEL/Fedora `FIPS` mode drops `ssh-ed25519`, for example) - this check catches that before the old key is ever touched.
-- The new key is installed and proven to work before anything old is touched. Phase 2 opens by resetting the connection and reconnecting with the *new* key; if that fails, the playbook aborts on that host and none of the cleanup tasks run. Resetting the connection first matters if your `ansible.cfg` enables SSH `ControlPersist`: that multiplexes connections by host/port/user, not by identity file, so without the reset, Phase 2 could otherwise silently ride on Phase 1's still-open connection instead of genuinely testing the new key.
-- Every `sshd_config` change is validated with `sshd -t` before it's written.
-- Configuration is applied with a reload, never a restart, so sessions already open stay open.
-- `sshd_config` and `authorized_keys` are both backed up before every edit, so you can always roll back by hand.
-- Phase 2's cleanup (removing the old key, disabling legacy auth) runs inside an Ansible `block`/`rescue`. If anything in it fails partway through, `rescue` automatically restores `authorized_keys` and `sshd_config` from the backups just taken, reloads sshd, re-confirms connectivity, and fails with a clear message - all on the same still-open connection, before it could be lost. A reload that itself fails does not abort the rollback: the restored files are already on disk and sshd reads `authorized_keys` per connection, so the rollback finishes and the failure message tells you to reload sshd by hand.
+**Phase 1 confirms the target will actually accept the key type.** It reads the effective `PubkeyAcceptedAlgorithms` from `sshd -T`, after any crypto-policy has been applied, and fails the host before Phase 2 runs if there is no real signature algorithm for the new key's type. A key type can pass Phase 0's local checks and still be rejected by a target's crypto-policy, so this catches the problem before the old key is touched.
+
+**The new key is proven to work before anything old is removed.** Phase 2 opens by resetting the connection and reconnecting with the new key. If that fails, the playbook aborts on that host and none of the cleanup tasks run.
+
+Resetting the connection first matters if your `ansible.cfg` enables SSH `ControlPersist`. That multiplexes connections by host, port and user, not by identity file, so without the reset, Phase 2 could silently ride on Phase 1's still-open connection instead of genuinely testing the new key.
+
+**Every `sshd_config` change is validated with `sshd -t` before it is written.**
+
+**Configuration is applied with a reload, never a restart,** so sessions already open stay open.
+
+**`sshd_config` and `authorized_keys` are backed up before every edit,** so you can always roll back by hand.
+
+**Phase 2's cleanup runs inside a `block`/`rescue`.** If removing the old key or disabling legacy auth fails partway through, `rescue` restores `authorized_keys` and `sshd_config` from the backups just taken, reloads sshd, re-confirms connectivity, and fails with a clear message. All of that happens on the same still-open connection, before it could be lost.
+
+A reload that itself fails does not abort the rollback. The restored files are already on disk and sshd reads `authorized_keys` per connection, so the rollback finishes and the failure message tells you to reload sshd by hand.
+
+## What each phase does
 
 ### Phase 0: validate locally
 
-1. Assert `old_private_key`, `new_private_key`, `old_public_key_file`, `new_public_key_file` are set
-2. Inspect `new_public_key_file`'s type, size, and fingerprint
-3. Reject weak/deprecated types and undersized RSA keys
-4. Confirm `new_private_key` and `new_public_key_file` are a matching pair
+1. Assert `old_private_key`, `new_private_key`, `old_public_key_file` and `new_public_key_file` are set.
+2. Inspect the type, size and fingerprint of `new_public_key_file`.
+3. Reject weak or deprecated types and undersized RSA keys.
+4. Confirm `new_private_key` and `new_public_key_file` are a matching pair.
 
 ### Phase 1: install the new key
 
-1. Determine the sshd service name for the OS family (Debian uses `ssh`, others use `sshd`)
-2. Back up `authorized_keys` (if it exists)
-3. Add the new public key to `authorized_keys`, keeping the old key in place for now
-4. Enable `PubkeyAuthentication` in `sshd_config` (backed up first)
-5. Make sure `AuthorizedKeysFile` points at the default location (backed up first)
-6. If requested, append PQC/hybrid algorithms to `sshd_config` and/or apply a RHEL/Fedora crypto-policy (see [PQC Algorithm Negotiation](#pqc-algorithm-negotiation))
-7. Look for drop-in config files and `Match` blocks that might quietly override what was just set
-8. Apply the sshd configuration changes
-9. Extract the effective `PubkeyAcceptedAlgorithms`/`KexAlgorithms` from `sshd -T` and **fail the host** if the new key's real signature algorithm isn't among them (see [Key Validation](#key-validation-pqc-readiness)); warn, informationally, for any requested PQC algorithm that's still missing
+1. Determine the sshd service name for the OS family. Debian uses `ssh`, others use `sshd`.
+2. Back up `authorized_keys`, if it exists.
+3. Add the new public key to `authorized_keys`, keeping the old key in place for now.
+4. Enable `PubkeyAuthentication` in `sshd_config`, backing it up first.
+5. Make sure `AuthorizedKeysFile` points at the default location, backing up first.
+6. If requested, append PQC or hybrid algorithms to `sshd_config` and apply a RHEL/Fedora crypto-policy.
+7. Look for drop-in config files and `Match` blocks that might quietly override what was just set.
+8. Apply the sshd configuration changes.
+9. Read the effective `PubkeyAcceptedAlgorithms` and `KexAlgorithms` from `sshd -T`, and fail the host if the new key's real signature algorithm is not among them. Any requested PQC algorithm that is still missing produces an informational warning.
 
 ### Phase 2: verify and clean up
 
-1. Reset the connection, so nothing below can ride on a `ControlPersist` session left open from Phase 1
-2. Reconnect and gather facts with the new private key - this is the authentication gate
-3. Ping the host to confirm the new key works
-4. Assert the new key actually authenticated before doing anything else
-5. From here on, steps 6-10 run inside a `block`/`rescue`: if any of them fail, `rescue` automatically restores `authorized_keys` and `sshd_config` from the backups taken below, reloads sshd (best effort - a failed reload is reported, not fatal, since the restored files are already in place), re-confirms connectivity, and fails with a clear message instead of leaving the host half-changed
-6. Back up `authorized_keys`, then remove the old public key from it
-7. Optionally make `authorized_keys` exclusive to the new key
-8. Disable legacy auth methods (password, keyboard-interactive) if requested, backing up `sshd_config` first
-9. Apply the final sshd configuration
-10. One last connectivity check
+1. Reset the connection, so nothing below can ride on a `ControlPersist` session left open from Phase 1.
+2. Reconnect and gather facts with the new private key. This is the authentication gate.
+3. Ping the host to confirm the new key works.
+4. Assert the new key really authenticated before doing anything else.
+5. Steps 6 to 10 run inside a `block`/`rescue`. If any of them fail, the backups taken below are restored, sshd is reloaded on a best-effort basis, connectivity is re-confirmed, and the play fails with a clear message rather than leaving the host half-changed.
+6. Back up `authorized_keys`, then remove the old public key from it.
+7. Optionally make `authorized_keys` exclusive to the new key.
+8. Disable password and keyboard-interactive auth if requested, backing up `sshd_config` first.
+9. Apply the final sshd configuration.
+10. Run one last connectivity check.
 
-## Role Reference
+## Role reference
 
-All the actual logic lives in the `ssh_key_rotation` role (`roles/ssh_key_rotation/`), following the standard Ansible role layout:
+All the logic lives in the `ssh_key_rotation` role, under `roles/ssh_key_rotation/`, following the standard Ansible role layout:
 
 | Path | Purpose |
 |------|---------|
 | `defaults/main.yml` | Every optional variable in this README, with its default value |
 | `handlers/main.yml` | The single `Reload sshd` handler, shared by the install and verify stages |
 | `tasks/validate.yml` | Phase 0: local pre-flight validation, no remote connections |
-| `tasks/install.yml` | Phase 1: connect with the OLD key, install the NEW key, prepare sshd |
-| `tasks/verify.yml` | Phase 2: reconnect with the NEW key to prove it works, then remove the OLD key/legacy auth |
-| `tasks/manage_crypto_policy.yml` | RHEL/Fedora crypto-policy management, shared via `include_tasks` by both the validate (control node) and install (target) stages |
-| `meta/main.yml` | Role metadata (supported platforms, minimum Ansible version) |
+| `tasks/install.yml` | Phase 1: connect with the old key, install the new key, prepare sshd |
+| `tasks/verify.yml` | Phase 2: reconnect with the new key to prove it works, then remove the old key and legacy auth |
+| `tasks/manage_crypto_policy.yml` | RHEL/Fedora crypto-policy management, included by both the validate and install stages |
+| `meta/main.yml` | Role metadata: supported platforms, minimum Ansible version |
 
-The role has no single `tasks/main.yml` entry point, because each stage authenticates differently (validate runs locally, install uses the OLD key, verify uses the NEW key) - it must be included with an explicit `tasks_from`.
+There is deliberately no `tasks/main.yml` entry point, because each stage authenticates differently. Validate runs locally, install uses the old key, and verify uses the new key. The role must be included with an explicit `tasks_from`.
 
-`playbooks/rotate.yml` is the entry point that ties the three stages together as three separate plays, since each needs a different host/connection context:
+`playbooks/rotate.yml` is the entry point that ties the three stages together as three separate plays, since each needs a different host and connection context:
 
 ```yaml
 - hosts: localhost
@@ -339,106 +418,116 @@ The role has no single `tasks/main.yml` entry point, because each stage authenti
     - ansible.builtin.include_role: {name: ssh_key_rotation, tasks_from: verify}
 ```
 
-Three-phase SSH key rotation with safety gates.
-
-**Hosts pattern:** `rotate` (define this group in your inventory)
-
-**Example inventory** (`inventory.ini`):
-
-```ini
-[rotate]
-prod-web-01 ansible_host=10.0.1.10
-prod-web-02 ansible_host=10.0.1.11
-prod-db-01 ansible_host=10.0.2.10
-```
-
 ## Troubleshooting
 
 ### Phase 0 validation failures
 
-These all happen before any host is touched, so there's no risk of a lockout while you fix them:
+These all happen before any host is touched, so there is no risk of a lockout while you fix them.
 
-- **"is in ssh_key_rotation_reject_key_types"** - the new key's type (e.g. DSA) is explicitly blocked; generate a new key with a stronger algorithm
-- **"not in ssh_key_rotation_accepted_key_types or ssh_key_rotation_pqc_key_types"** - the type isn't recognized; either generate an accepted key type or add the type to `ssh_key_rotation_accepted_key_types`/`ssh_key_rotation_pqc_key_types`
-- **"RSA key; minimum accepted is ... bits"** - regenerate with `ssh-keygen -t rsa -b 4096` or switch to `ed25519`
-- **"does not match new_public_key_file"** - `new_private_key` and `new_public_key_file` aren't actually a matching pair; double-check both paths
+**"is in ssh_key_rotation_reject_key_types"** - the new key's type, DSA for example, is explicitly blocked. Generate a new key with a stronger algorithm.
+
+**"not in ssh_key_rotation_accepted_key_types or ssh_key_rotation_pqc_key_types"** - the type is not recognised. Either generate an accepted key type, or add the type to one of those two lists.
+
+**"RSA key; minimum accepted is ... bits"** - regenerate with `ssh-keygen -t rsa -b 4096`, or switch to `ed25519`.
+
+**"does not match new_public_key_file"** - `new_private_key` and `new_public_key_file` are not actually a matching pair. Double-check both paths.
 
 ### "sshd -T ... does not include any signature algorithm for a ... key"
 
-Phase 1 aborted before touching the old key: the target's effective `PubkeyAcceptedAlgorithms` (from `sshd -T`, after any crypto-policy is applied) doesn't include a real signature algorithm for your new key's type. The most common cause is a system-wide crypto-policy narrowing what's accepted - RHEL/Fedora's `FIPS` policy, for instance, only allows `ecdsa-sha2-*` and `rsa-sha2-*`, so an `ed25519` key will always be rejected there even though Phase 0's local checks consider it a perfectly good key type. Nothing has been broken; the old key is still in place. To fix it, either:
+Phase 1 aborted before touching the old key. The target's effective `PubkeyAcceptedAlgorithms`, read from `sshd -T` after any crypto-policy was applied, does not include a real signature algorithm for your new key's type.
 
-1. Generate a key type the target's policy actually accepts (check with `ssh <host> sudo sshd -T | grep -i pubkeyacceptedalgorithms`), e.g. `ssh-keygen -t ecdsa -b 256`, or
-2. Adjust the crypto-policy itself via `ssh_key_rotation_manage_crypto_policy`/`ssh_key_rotation_crypto_policy_setting` if the type you want should be allowed.
+The most common cause is a system-wide crypto-policy narrowing what is accepted. RHEL and Fedora's `FIPS` policy, for instance, allows only `ecdsa-sha2-*` and `rsa-sha2-*`, so an `ed25519` key will always be rejected there even though Phase 0's local checks consider it a perfectly good key type.
 
-This check exists because an earlier version of this playbook only did a substring search across the *entire* `sshd -T` output for the key type name, which produced false negatives (e.g. a `hostkey /etc/ssh/ssh_host_ed25519_key` line would satisfy a check for `ed25519`, even when `PubkeyAcceptedAlgorithms` didn't include `ssh-ed25519` at all) and let Phase 2 go on to remove the old key regardless. See [CHANGELOG.md](CHANGELOG.md) for details.
+Nothing has been broken and the old key is still in place. To fix it, either:
+
+1. Generate a key type the target's policy accepts. Check with `ssh <host> sudo sshd -T | grep -i pubkeyacceptedalgorithms`, then for example `ssh-keygen -t ecdsa -b 256`.
+2. Adjust the crypto-policy itself via `ssh_key_rotation_manage_crypto_policy` and `ssh_key_rotation_crypto_policy_setting`, if the type you want should be allowed.
+
+This check exists because an earlier version of the playbook did a substring search across the entire `sshd -T` output for the key type name. That produced false negatives: a `hostkey /etc/ssh/ssh_host_ed25519_key` line would satisfy a check for `ed25519` even when `PubkeyAcceptedAlgorithms` did not include `ssh-ed25519` at all, and Phase 2 would go on to remove the old key regardless. See [CHANGELOG.md](CHANGELOG.md) for details.
 
 ### "New key did not authenticate"
 
-Phase 2 couldn't connect with the new key. A few things to check:
+Phase 2 could not connect with the new key. Things to check:
 
-1. **Key paths are correct** - double-check `-e new_private_key` and `-e new_public_key_file`
-2. **Key formats match** - the private key type has to match the public key (both ed25519, both rsa, etc.)
-3. **File permissions** - the new private key needs to be readable by the Ansible user
-4. **Public key was installed** - Phase 1 has to have completed successfully; check that the key is actually in `~/.ssh/authorized_keys` on the target
-5. **Target's crypto-policy accepts the key type** - see "sshd -T ... does not include any signature algorithm" above; Phase 1 should already have caught this, but double-check with `sudo sshd -T | grep -i pubkeyacceptedalgorithms` on the target
+1. **Key paths are correct.** Double-check `-e new_private_key` and `-e new_public_key_file`.
+2. **Key formats match.** The private key type has to match the public key: both ed25519, both rsa, and so on.
+3. **File permissions.** The new private key needs to be readable by the Ansible user.
+4. **The public key was installed.** Phase 1 must have completed successfully. Check the key is actually in `~/.ssh/authorized_keys` on the target.
+5. **The target's crypto-policy accepts the key type.** See the section above. Phase 1 should already have caught this, but confirm with `sudo sshd -T | grep -i pubkeyacceptedalgorithms` on the target.
 
 ### "Drop-in sshd config files found"
 
 Phase 1 spotted override files in `/etc/ssh/sshd_config.d/`. Worth reviewing:
 
-1. See what's there: `ansible all -i inventory.ini -m ansible.builtin.find -a "paths=/etc/ssh/sshd_config.d patterns='*.conf'" -b`
-2. Make sure none of them re-enable `PasswordAuthentication yes` or similar
-3. If needed, update the drop-ins by hand before running Phase 2, or pass `ssh_key_rotation_make_exclusive=false` to keep the old key active a bit longer
+1. See what is there: `ansible all -i inventory.ini -m ansible.builtin.find -a "paths=/etc/ssh/sshd_config.d patterns='*.conf'" -b`
+2. Make sure none of them re-enable `PasswordAuthentication yes` or similar.
+3. If needed, update the drop-ins by hand before running Phase 2, or pass `ssh_key_rotation_make_exclusive=false` to keep the old key active a little longer.
 
 ### PQC algorithms not negotiating
 
-If Phase 1's post-reload check warns that `sshd -T` doesn't mention a requested PQC algorithm, or Phase 2 fails to authenticate with a PQC-type key, work through these in order:
+If Phase 1's post-reload check warns that `sshd -T` does not mention a requested PQC algorithm, or Phase 2 fails to authenticate with a PQC-type key, work through these in order:
 
-1. Confirm the control node's ssh binary actually supports the algorithms you asked for (Phase 0 already checks this, but `ssh -Q kex` / `ssh -Q key-sig` will tell you directly)
-2. Confirm the target's sshd build supports them too: `sshd -T | grep -i kexalgorithms`
-3. If `ssh_key_rotation_manage_crypto_policy` is set on a RHEL/Fedora host, check the policy actually changed: `update-crypto-policies --show`
-4. Look for a `50-redhat.conf` or other drop-in overriding your settings (see "Drop-in sshd config files found" above)
+1. Confirm the control node's ssh binary supports the algorithms you asked for. Phase 0 already checks this, but `ssh -Q kex` and `ssh -Q key-sig` will tell you directly.
+2. Confirm the target's sshd build supports them too: `sshd -T | grep -i kexalgorithms`.
+3. If `ssh_key_rotation_manage_crypto_policy` is set on a RHEL or Fedora host, check the policy actually changed: `update-crypto-policies --show`.
+4. Look for a `50-redhat.conf` or other drop-in overriding your settings.
 
 ### "Desired crypto policy ... needs module(s) ... that were not found"
 
-`ssh_key_rotation_crypto_policy_setting` named a `BASE:MODULE` combination (e.g. `FIPS:PQ`) but that host has no `MODULE.pmod` file under `/usr/share/crypto-policies/policies/modules/` or `/etc/crypto-policies/policies/modules/`. This is a hard stop *before* `update-crypto-policies --set` is ever called, on the control node (Phase 0) or the target (Phase 1), so nothing has changed on that host yet. To fix it:
+`ssh_key_rotation_crypto_policy_setting` named a `BASE:MODULE` combination such as `FIPS:PQ`, but that host has no matching `MODULE.pmod` file under `/usr/share/crypto-policies/policies/modules/` or `/etc/crypto-policies/policies/modules/`.
 
-1. List what's actually available: `ssh <host> ls /usr/share/crypto-policies/policies/modules/*.pmod /etc/crypto-policies/policies/modules/*.pmod`
-2. Check for typos in the module name, or drop a custom `MODULE.pmod` into `/etc/crypto-policies/policies/modules/` if you need one that doesn't ship with the OS
-3. See [Combining a base policy with a subpolicy module](#combining-a-base-policy-with-a-subpolicy-module-basemodule) above for why `FIPS:PQ` is the combination most people want on RHEL/AlmaLinux 9
+This is a hard stop before `update-crypto-policies --set` is ever called, on the control node in Phase 0 or the target in Phase 1, so nothing has changed on that host. To fix it:
+
+1. List what is actually available: `ssh <host> ls /usr/share/crypto-policies/policies/modules/*.pmod /etc/crypto-policies/policies/modules/*.pmod`
+2. Check for typos in the module name, or drop a custom `MODULE.pmod` into `/etc/crypto-policies/policies/modules/` if you need one the OS does not ship.
+3. See [Combining a base policy with a subpolicy module](#combining-a-base-policy-with-a-subpolicy-module) for why `FIPS:PQ` is the combination most people want on RHEL and AlmaLinux 9.
 
 ### "Permission denied" on Phase 1
 
 Check that:
 
-1. The old private key is readable and correct
-2. The remote user matches the one Ansible is actually using (run with `-vvv` to confirm)
-3. The SSH keys aren't passphrase-protected (or use `SSH_ASKPASS` with `--ask-pass`)
+1. The old private key is readable and correct.
+2. The remote user matches the one Ansible is actually using. Run with `-vvv` to confirm.
+3. The SSH keys are not passphrase-protected, or use `SSH_ASKPASS` with `--ask-pass`.
 
 ### Module execution fails with "Operation not permitted" on a hardened host
 
-If Ansible fails while gathering facts or running any module (not this playbook specifically) with an error like `can't open file '.../AnsiballZ_setup.py': [Errno 1] Operation not permitted`, the target likely has `/tmp`, `/var/tmp`, and/or the user's home directory mounted `noexec` - a common CIS/STIG hardening baseline. Ansible's default mechanism copies each module to a remote temp file and executes it, which a `noexec` mount blocks outright. Either:
+If Ansible fails while gathering facts or running any module, not just this playbook, with an error like `can't open file '.../AnsiballZ_setup.py': [Errno 1] Operation not permitted`, the target likely has `/tmp`, `/var/tmp` or the user's home directory mounted `noexec`. That is a common CIS and STIG hardening baseline.
 
-1. Enable [pipelining](https://docs.ansible.com/ansible/latest/collections/ansible/builtin/ssh_connection.html#parameter-pipelining) (`pipelining = True` under the `[ssh_connection]` section of `ansible.cfg`, or `ANSIBLE_PIPELINING=True`), which streams most modules over stdin instead of writing them to disk, or
-2. Point `remote_tmp` (`ansible_remote_tmp`) at a directory that's genuinely executable on that host, if one exists
+Ansible's default mechanism copies each module to a remote temp file and executes it, which a `noexec` mount blocks outright. Either:
+
+1. Enable [pipelining](https://docs.ansible.com/ansible/latest/collections/ansible/builtin/ssh_connection.html#parameter-pipelining), with `pipelining = True` under `[ssh_connection]` in `ansible.cfg` or `ANSIBLE_PIPELINING=True`. This streams most modules over stdin instead of writing them to disk.
+2. Point `remote_tmp` (`ansible_remote_tmp`) at a directory that is genuinely executable on that host, if one exists.
 
 Pipelining is the more robust fix, since some hardening baselines make every writable path `noexec`.
 
 ## Development
 
-### Running locally with vagrant or containers
-
 ```bash
 # Build the collection
 ansible-galaxy collection build .
 
-# Test with a local VM (bring your own via vagrant/libvirt/podman)
+# Test against a local VM, brought up however you like
 ansible-playbook playbooks/rotate.yml -i 127.0.0.1, \
   -e old_private_key=~/.ssh/id_rsa \
   -e new_private_key=~/.ssh/id_ed25519 \
   -e new_public_key_file=./id_ed25519.pub \
   -e old_public_key_file=./id_rsa.pub
 ```
+
+## Contributing
+
+Issues and bug reports are welcome and genuinely useful.
+
+Pull requests are accepted from existing contributors only. If you would like to become one, email <github@krameff.com>.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full detail.
+
+The short version for contributors:
+
+- Playbooks pass `ansible-lint` and both Molecule scenarios
+- Changes preserve the safety model, meaning the new key is proven before the old key is removed
+- README.md and CHANGELOG.md are updated to match
 
 ## License
 
@@ -447,11 +536,3 @@ MIT
 ## Support
 
 For issues and feature requests, see the [GitHub repository](https://github.com/krameff/ssh_key_rotation).
-
-## Contributing
-
-Contributions are welcome. Please make sure:
-
-- Playbooks pass `ansible-lint`
-- Changes preserve the safety model (new key proven before old key removed)
-- Documentation is updated to match
