@@ -6,6 +6,11 @@
 
 - Release workflow: tagging `v*` builds the collection and publishes it to Galaxy, needs a `GALAXY_API_KEY` secret.
 - Release workflow fails the build if the tag doesn't match the version in `galaxy.yml`.
+- `CONTRIBUTING.md`, covering setup, the required checks and the pull request checklist.
+- `SECURITY.md`, with a private disclosure route for anything that could leave a host unreachable.
+- GitHub issue forms and a pull request template under `.github/`.
+- Pre-commit configuration for secret detection, whitespace, YAML and ansible-lint.
+- Releases now attach the collection tarball to a GitHub Release and attest its build provenance, so it can be traced back to this repository.
 
 ### Fixed
 
