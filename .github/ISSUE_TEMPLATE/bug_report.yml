@@ -1,0 +1,130 @@
+---
+
+name: Bug report
+description: Something went wrong during a rotation
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Before filing, please check the [troubleshooting
+        section](https://github.com/krameff/ssh_key_rotation#troubleshooting) of
+        the README. It covers the common failure modes, including crypto-policy
+        rejections and `sshd_config.d` drop-ins overriding what the playbook
+        writes.
+
+
+        If you have found a way this collection can lock a host out, please
+        report it privately instead. See the security link on the previous page.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you expect, and what did you get instead?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: phase
+    attributes:
+      label: Which phase failed
+      options:
+        - "Phase 0: validate, on the control node"
+        - "Phase 1: install, connected with the old key"
+        - "Phase 2: verify, reconnecting with the new key"
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: host-state
+    attributes:
+      label: Was the host left reachable
+      description: >-
+        This is the most important field. If a run left a host unreachable, that
+        is a safety model failure and will be prioritised over everything else.
+      options:
+        - "Yes, the old key still works"
+        - "Yes, the new key works"
+        - "No, the host is unreachable"
+        - Not sure yet
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: The command you ran
+      description: Redact key paths if they are sensitive.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Failing task and error output
+      description: >-
+        The failing task name and its error. Output from a run with `-vvv` is
+        much more useful. Please redact any key material.
+      render: text
+    validations:
+      required: true
+
+  - type: input
+    id: target-os
+    attributes:
+      label: Target OS and version
+      placeholder: "AlmaLinux 9.8, Ubuntu 22.04, openSUSE Leap 15.6"
+    validations:
+      required: true
+
+  - type: input
+    id: ansible-version
+    attributes:
+      label: Ansible version
+      description: Output of `ansible --version` on the control node.
+      placeholder: "ansible [core 2.18.1]"
+    validations:
+      required: true
+
+  - type: input
+    id: collection-version
+    attributes:
+      label: Collection version
+      placeholder: "1.0.0, or a commit SHA if installed from source"
+    validations:
+      required: true
+
+  - type: input
+    id: key-types
+    attributes:
+      label: Old and new key types
+      placeholder: "old rsa 4096, new ed25519"
+
+  - type: input
+    id: crypto-policy
+    attributes:
+      label: Crypto-policy on the target, if RHEL or Fedora family
+      description: Output of `update-crypto-policies --show`.
+      placeholder: "FIPS, DEFAULT:PQ, or leave blank if not applicable"
+
+  - type: textarea
+    id: dropins
+    attributes:
+      label: sshd_config drop-in files on the target
+      description: >-
+        Output of `ls /etc/ssh/sshd_config.d/`. These frequently override what
+        the playbook writes.
+      render: text
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Before submitting
+      options:
+        - label: I have read the troubleshooting section of the README
+          required: true
+        - label: I have redacted all private key material from this report
+          required: true
