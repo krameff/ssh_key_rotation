@@ -4,7 +4,7 @@ Thanks for your interest in improving this collection. This document covers how 
 
 For deeper detail on project layout, adding modules or filters, and publishing releases, see [DEVELOPMENT.md](DEVELOPMENT.md).
 
-NOTE: due to the number of open-source projects we work with and amount of PRS etc that have not been properly scoped. We only accept PRs from contributors. We will take all the information from issues and bug reports. 
+NOTE: due to the number of open-source projects we work with and amount of PRS etc that have not been properly scoped. We only accept PRs from contributors. We will take all the information from issues and bug reports.
 If you are interested in becoming a contributor, please drop us an email at <github@krameff.com>.
 
 ## The one rule that matters most
@@ -28,9 +28,13 @@ git clone https://github.com/krameff/ssh_key_rotation
 cd ssh_key_rotation
 
 python -m venv .venv && source .venv/bin/activate
-pip install "ansible>=2.18" ansible-lint "molecule>=25.0" "molecule-plugins[docker]"
+pip install "ansible>=2.18" ansible-lint pre-commit "molecule>=25.0" "molecule-plugins[docker]"
 
 ansible-galaxy install -r requirements.yml
+
+# Install the git hooks. Do not skip this: it is what stops a private key or a
+# secret reaching a commit in the first place
+pre-commit install
 ```
 
 Molecule needs a working Docker or Podman socket. The scenarios pull `geerlingguy` CI images for Ubuntu 22.04, Rocky Linux 9 and Rocky Linux 10.
@@ -62,14 +66,17 @@ The role has no working `tasks/main.yml` entry point by design, because each sta
 These are the same checks CI runs, so running them locally saves a round trip.
 
 ```bash
-# Lint the whole repo, not just the playbook, so the role is covered too
-ansible-lint
+# Everything the hooks cover: secret and private key detection, whitespace,
+# YAML lint, and ansible-lint. Runs automatically on commit once installed
+pre-commit run --all-files
 
-# Syntax check the entry point
+# Not covered by a hook, so run it separately
 ansible-playbook playbooks/rotate.yml --syntax-check
 ```
 
-`ansible-lint` runs on the `production` profile. Do not add `# noqa` comments to silence a rule without explaining why in the same commit.
+`ansible-lint` runs on the `production` profile, and lints the whole repository rather than just `playbooks/rotate.yml`, since that is only the entry point and all the logic lives in the role. Do not add `# noqa` comments to silence a rule without explaining why in the same commit.
+
+The hooks are the last line of defence against committing key material, which is why `pre-commit install` is not optional here. Pull requests are also checked by pre-commit.ci, which runs everything except `ansible-lint`. That one needs `ansible.posix` installed, so it runs in the CI workflow instead.
 
 ### Functional tests
 
@@ -149,7 +156,7 @@ Do not bump the version in `galaxy.yml` in a pull request. Releases are cut sepa
 
 ## Pull request checklist
 
-- [ ] `ansible-lint` passes with no new warnings
+- [ ] `pre-commit run --all-files` passes, ansible-lint included
 - [ ] `ansible-playbook playbooks/rotate.yml --syntax-check` passes
 - [ ] `molecule test -s default` and `molecule test -s rollback` pass, or you have explained why they could not be run
 - [ ] New behaviour is covered by a test that fails without the change

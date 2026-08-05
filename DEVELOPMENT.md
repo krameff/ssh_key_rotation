@@ -68,14 +68,19 @@ python -m venv .venv && source .venv/bin/activate
 pip install "ansible>=2.18"
 
 # Testing tools
-pip install ansible-lint "molecule>=25.0" "molecule-plugins[docker]"
+pip install ansible-lint pre-commit "molecule>=25.0" "molecule-plugins[docker]"
 
 # Collection dependencies
 ansible-galaxy install -r requirements.yml
 
+# Install the git hooks
+pre-commit install
+
 # Sanity check the collection structure
 ansible-galaxy collection build .
 ```
+
+`pre-commit install` writes to `.git/hooks/`, which is not tracked, so every clone needs it run once.
 
 ## Adding code
 
@@ -100,16 +105,29 @@ ansible-galaxy collection build .
 
 ### Lint and syntax
 
-These are the two checks CI runs on every push and pull request.
-
 ```bash
-# Lint the whole repo. rotate.yml is only the entry point, so linting it alone misses the role
-ansible-lint
+# Every hook: secret and private key detection, whitespace, YAML lint, ansible-lint
+pre-commit run --all-files
 
+# Not covered by a hook
 ansible-playbook playbooks/rotate.yml --syntax-check
 ```
 
-`ansible-lint` runs on the `production` profile, configured in `.ansible-lint`.
+`ansible-lint` runs on the `production` profile, configured in `.ansible-lint`. It lints the whole repository, because `playbooks/rotate.yml` is only the entry point and linting it alone would miss the role.
+
+Hooks run automatically on commit once `pre-commit install` has been run. To bypass them for a work-in-progress commit, `git commit --no-verify`, but do not push a branch that has not passed them.
+
+### Where each check runs
+
+| Check | Where |
+|-------|-------|
+| All hooks except `ansible-lint` | pre-commit.ci, on pull requests |
+| `ansible-lint`, syntax check | `.github/workflows/ci.yml` |
+| Molecule scenarios | `.github/workflows/molecule.yml` |
+
+`ansible-lint` is in the `ci.skip` list in `.pre-commit-config.yaml` because pre-commit.ci's runner cannot install `ansible.posix`, so the hook could not resolve the collection there. It runs in the CI workflow instead, which does an `ansible-galaxy install -r requirements.yml` first.
+
+`.pre-commit-config.yaml` also pins `default_language_version` to Python 3.12, because the ansible-lint hook's manifest asks for an interpreter newer than most machines have installed, and pre-commit fails to build the hook environment at all without the override.
 
 ### Dry run
 

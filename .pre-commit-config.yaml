@@ -4,7 +4,13 @@
 ##### Inherited
 ci:
   autofix_prs: false
-  skip: [detect-aws-credentials, ansible-lint]
+  skip: [ansible-lint]
+
+# Hook repos may pin a language_version newer than the interpreter available here
+# (ansible-lint v26.3.0 asks for python3.14). Pin to the venv's Python so hook
+# environments build against the same interpreter ansible-core is installed under.
+default_language_version:
+  python: python3.12
 
 repos:
 - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -13,6 +19,9 @@ repos:
   # Safety
   - id: detect-aws-credentials
     name: Detect AWS Credentials
+    # Without this the hook exits 2 on any machine that has no ~/.aws/credentials
+    # to compare against, which is a tooling error rather than a finding.
+    args: [--allow-missing-credentials]
   - id: detect-private-key
     name: Detect Private Keys
 
@@ -54,8 +63,11 @@ repos:
   - id: ansible-lint
     name: Ansible-lint
     description: This hook runs ansible-lint.
-    entry: python3 -m ansiblelint --force-color site.yml -c .ansible-lint
+    # This collection has no site.yml. rotate.yml is only the entry point, so lint
+    # the whole repo to cover roles/ssh_key_rotation too.
+    entry: python3 -m ansiblelint --force-color -c .ansible-lint
     language: python
+    language_version: python3.12
     # do not pass files to ansible-lint, see:
     # https://github.com/ansible/ansible-lint/issues/611
     pass_filenames: false
