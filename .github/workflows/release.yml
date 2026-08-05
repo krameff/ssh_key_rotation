@@ -9,9 +9,18 @@ on:
   # Lets the build be exercised without cutting a tag; publishing stays gated on the tag.
   workflow_dispatch:
 
+# Default the whole workflow to read-only. The job below widens this to exactly what it
+# needs. This job holds GALAXY_API_KEY, so it should not also inherit a writable token.
+permissions:
+  contents: read
+
 jobs:
   build-and-publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write      # create the GitHub Release and attach the tarball
+      id-token: write      # Sigstore keyless signing for the provenance attestation
+      attestations: write  # record the attestation against this repository
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -41,11 +50,38 @@ jobs:
       - name: Build the collection artifact
         run: ansible-galaxy collection build --output-path ./dist
 
+      # Ties the tarball to this repository, commit and workflow run. Keyless via Sigstore,
+      # so there is no signing key to hold. Verify with:
+      #   gh attestation verify <tarball> --repo krameff/ssh_key_rotation
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/*.tar.gz
+
+      # Kept for workflow_dispatch runs, where no Release is created. Expires with the run.
       - name: Upload the artifact to the workflow run
         uses: actions/upload-artifact@v5
         with:
           name: collection-tarball
           path: dist/*.tar.gz
+
+      # Galaxy is the normal install route, but it serves no signature or provenance for
+      # community collections. Attaching the same tarball here gives anyone who wants to
+      # check where it came from something they can actually fetch and verify.
+      - name: Create the GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz \
+            --title "${GITHUB_REF_NAME}" \
+            --notes "See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/CHANGELOG.md).
+
+          Verify this tarball came from this repository:
+
+          \`\`\`
+          gh attestation verify krameff-ssh_key_rotation-*.tar.gz --repo ${GITHUB_REPOSITORY}
+          \`\`\`"
 
       - name: Publish to Ansible Galaxy
         if: startsWith(github.ref, 'refs/tags/v')
