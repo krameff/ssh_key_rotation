@@ -1,0 +1,92 @@
+---
+
+# Writes one of this role's sshd drop-ins, records in the host's state fact whether this run
+# CREATED it or found one already there, and validates the merged configuration before anything
+# reloads. Shared by install.yml and verify.yml so both stages behave identically.
+#
+# Callers pass:
+#   ssh_key_rotation_dropin_name     - bare filename, e.g. "ssh-key-rotation-lockdown.conf"
+#   ssh_key_rotation_dropin_content  - the file body (already rendered)
+#   ssh_key_rotation_dropin_key      - key under `dropins` in the state fact, e.g. "lockdown"
+#
+# The created-vs-pre-existing distinction is what lets a rollback undo the right thing: a file we
+# created must be deleted, while one that already existed must be restored as it was. Deleting a
+# pre-existing drop-in would destroy configuration this role never owned.
+
+- name: Dropin | Resolve this drop-in's full path
+  ansible.builtin.set_fact:
+    ssh_key_rotation_dropin_path: >-
+      {{ ssh_key_rotation_sshd_dropin_dir }}/{{ ssh_key_rotation_sshd_dropin_effective_prefix }}-{{ ssh_key_rotation_dropin_name }}
+
+- name: Dropin | Check whether this drop-in already exists
+  ansible.builtin.stat:
+    path: "{{ ssh_key_rotation_dropin_path }}"
+  become: true
+  register: ssh_key_rotation_dropin_stat
+
+- name: Dropin | Back up a pre-existing drop-in before overwriting it
+  when: ssh_key_rotation_dropin_stat.stat.exists
+  ansible.builtin.copy:
+    src: "{{ ssh_key_rotation_dropin_path }}"
+    dest: "{{ ssh_key_rotation_dropin_path }}.bak-{{ ansible_facts.date_time.iso8601_basic_short }}"
+    remote_src: true
+    mode: preserve
+  become: true
+  register: ssh_key_rotation_dropin_backup
+
+# Recorded BEFORE the write, so that if the write or the validation below fails, the rescue still
+# knows whether this file was ours to delete.
+- name: Dropin | Record this drop-in in the host's rotation state
+  ansible.builtin.include_tasks: state_write.yml
+  # Built as one Jinja expression, not as YAML keys. A "{{ }}" used as a mapping KEY is not
+  # templated - it is stored literally - so the nested form recorded a drop-in called
+  # "{{ ssh_key_rotation_dropin_key }}" and the rollback would never find it.
+  vars:
+    ssh_key_rotation_state: >-
+      {{ {'dropins': {ssh_key_rotation_dropin_key: {
+           'path': ssh_key_rotation_dropin_path,
+           'created_by_role': (not ssh_key_rotation_dropin_stat.stat.exists),
+           'backup': (ssh_key_rotation_dropin_backup.dest | default(none)),
+         }}} }}
+
+# No `validate:` here on purpose. `sshd -t -f <fragment>` checks the fragment as if it were a whole
+# config - it fills in defaults and proves nothing about the merged result - and copy's validate
+# runs against a controller-side temp path that SELinux or permissions can reject outright. The
+# authoritative check is `sshd -t` on the real merged configuration, immediately below, before any
+# handler is allowed to fire.
+- name: Dropin | Write the drop-in
+  ansible.builtin.copy:
+    dest: "{{ ssh_key_rotation_dropin_path }}"
+    content: "{{ ssh_key_rotation_dropin_content }}"
+    mode: "0644"
+    owner: root
+    group: root
+  become: true
+  register: ssh_key_rotation_dropin_written
+  notify: Reload sshd
+
+- name: Dropin | Validate the MERGED sshd configuration with this drop-in in place
+  ansible.builtin.command: sshd -t
+  become: true
+  changed_when: false
+  failed_when: false
+  register: ssh_key_rotation_dropin_validate
+
+# Self-healing: an invalid merged config is removed here rather than left for the rescue, because
+# it must never survive long enough for a reload to pick it up. A reload with a broken config fails
+# without dropping the listener, but leaving the file in place would break the NEXT legitimate
+# reload by anything else on the system.
+- name: Dropin | Remove the drop-in again if it broke the merged configuration
+  when: ssh_key_rotation_dropin_validate.rc != 0
+  ansible.builtin.file:
+    path: "{{ ssh_key_rotation_dropin_path }}"
+    state: absent
+  become: true
+
+- name: Dropin | Fail if this drop-in produced an invalid sshd configuration
+  when: ssh_key_rotation_dropin_validate.rc != 0
+  ansible.builtin.fail:
+    msg: >-
+      Writing {{ ssh_key_rotation_dropin_path }} made the merged sshd configuration invalid
+      ({{ ssh_key_rotation_dropin_validate.stderr | default('no stderr') | trim }}). The drop-in has
+      been removed again and sshd was never reloaded, so the running configuration is untouched.
