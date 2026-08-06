@@ -57,9 +57,16 @@ Molecule needs a working Docker or Podman socket. The scenarios pull `geerlinggu
 | RHEL/Fedora crypto-policy handling | `roles/ssh_key_rotation/tasks/manage_crypto_policy.yml` |
 | A variable's default value | `roles/ssh_key_rotation/defaults/main.yml` |
 | How the three stages are wired together | `playbooks/rotate.yml` |
-| Functional tests | `extensions/molecule/default/`, `extensions/molecule/rollback/` |
+| Functional tests | `extensions/molecule/default/`, `nonroot/`, `rollback/` |
+| Shared test setup for all scenarios | `extensions/molecule/resources/prepare.yml` |
 
 The role has no working `tasks/main.yml` entry point by design, because each stage authenticates differently. Do not add one.
+
+Everything the role writes to `sshd_config` goes into a marked block placed by
+`tasks/resolve_sshd_anchor.yml`, never with a bare `lineinfile`. A `lineinfile` regexp matching a
+keyword anywhere in the file replaces the LAST occurrence, and `Match` blocks sit at the end of
+`sshd_config`, so it silently edits per-user policy instead of the global section. If you add a
+new `sshd_config` setting, put it in the managed block.
 
 ## Running the checks
 
@@ -84,9 +91,17 @@ The hooks are the last line of defence against committing key material, which is
 # Full rotation across three OS images, run twice to prove idempotency
 molecule test -s default
 
+# The same rotation against a non-root user, to catch file-ownership mistakes
+molecule test -s nonroot
+
 # Deliberately breaks a rotation mid-verify, to prove the rescue block restores access
 molecule test -s rollback
 ```
+
+If you touch anything that writes or restores `authorized_keys`, run `nonroot` and `rollback`.
+They rotate a non-root user, which is the only way an ownership mistake shows up: the role works
+under `become`, and a file left owned by root is silently ignored by sshd's `StrictModes`, locking
+the account out. With a `root` target that same bug looks correct.
 
 Both scenarios generate their own ephemeral SSH keypairs and inventory into Molecule's per-run directory, so nothing needs to exist in your working tree for them to run.
 

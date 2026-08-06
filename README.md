@@ -23,8 +23,10 @@ An Ansible collection for rotating SSH keys across your infrastructure without b
 - [Usage](#usage)
 - [Variables](#variables)
 - [Key validation](#key-validation)
-- [PQC algorithm negotiation](#pqc-algorithm-negotiation)
+- [Drop-in overrides](#drop-in-overrides)
+- [Post-quantum algorithms](#post-quantum-algorithms) (full detail in [PQC.md](PQC.md))
 - [Safety model](#safety-model)
+- [Limitations](#limitations)
 - [What each phase does](#what-each-phase-does)
 - [Role reference](#role-reference)
 - [Troubleshooting](#troubleshooting)
@@ -54,13 +56,15 @@ Every `sshd_config` change is checked with `sshd -t` before it is written, and b
 
 **Cross-OS support.** The Debian/Ubuntu vs RHEL/CentOS `sshd` service-name difference is handled for you.
 
-**Drop-in and `Match` block awareness.** Warns if files in `/etc/ssh/sshd_config.d/` or `Match` blocks might silently override what the playbook is setting.
+**Lock-down is verified, not assumed.** After disabling password and keyboard-interactive auth, the playbook re-reads `sshd -T` and fails if either is still enabled, so a drop-in file cannot quietly leave password login working on a run that reported success.
+
+**Drop-in and `Match` block awareness.** Warns about files in `/etc/ssh/sshd_config.d/` that could override the main config, and verifies the lock-down applies to the rotated user specifically, so a `Match User` block re-enabling password login is caught rather than missed. Optionally writes its own drop-in so the lock-down wins outright. See [Drop-in overrides](#drop-in-overrides).
 
 **Flexible auth policy.** Optionally make the new key exclusive, and optionally disable password and keyboard-interactive auth.
 
 **Validated, backed-up config edits.** Every `sshd` change is checked with `sshd -t` and backed up before it is written.
 
-**Post-quantum negotiation, opt-in.** Can enable post-quantum and hybrid key exchange and signature algorithms across `sshd_config`, RHEL/Fedora crypto-policy, and the control node's own ssh client. See [PQC algorithm negotiation](#pqc-algorithm-negotiation).
+**Post-quantum negotiation, opt-in.** Can enable post-quantum and hybrid key exchange and signature algorithms across `sshd_config`, RHEL/Fedora crypto-policy, and the control node's own ssh client. See [PQC.md](PQC.md).
 
 ## Requirements
 
@@ -78,9 +82,14 @@ The collection targets Debian/Ubuntu and RHEL/Fedora-family hosts generally. The
 | OS | Notes |
 |----|-------|
 | Ubuntu 22.04 LTS (Jammy Jellyfish) | Watch for `sshd_config.d/` drop-ins such as cloud-init's `50-cloud-init.conf`, which can override settings written further down `sshd_config`. See [Drop-in sshd config files found](#drop-in-sshd-config-files-found). |
-| AlmaLinux 9.8 (Olive Jaguar), `FIPS` crypto-policy | `FIPS` on its own has no PQC key exchange. Use `ssh_key_rotation_crypto_policy_add_modules: [PQ]` to add it. See [Combining a base policy with a subpolicy module](#combining-a-base-policy-with-a-subpolicy-module). |
-| AlmaLinux 10.2 (Lavender Lion), `FIPS` crypto-policy | `FIPS` already includes PQC key exchange here. No extra module needed. |
+| Ubuntu 26.04 LTS, OpenSSH 10.2 | Ships `50-cloud-init.conf` with `PasswordAuthentication yes`, which overrides the lock-down. Phase 2 fails rather than reporting a success it did not achieve. Fix the drop-in and re-run. |
+| Rocky Linux 9.8 (Blue Onyx), `FIPS` crypto-policy | `FIPS` excludes `ssh-ed25519`, so ed25519 keys are rejected. Use ECDSA or RSA. `FIPS` alone has no PQC key exchange; add it with `ssh_key_rotation_crypto_policy_add_modules: [PQ]`. |
+| AlmaLinux 9.8 (Olive Jaguar), `FIPS` crypto-policy | `FIPS` on its own has no PQC key exchange. Use `ssh_key_rotation_crypto_policy_add_modules: [PQ]` to add it. See [Combining a base policy with a subpolicy module](PQC.md#combining-a-base-policy-with-a-subpolicy-module). |
+| AlmaLinux 10.1 / 10.2 (Lavender Lion), `FIPS` crypto-policy | `FIPS` already includes PQC key exchange here. No extra module needed. As on 9.x, ed25519 is not accepted under FIPS. |
 | openSUSE Leap 15.6 | Ships Python 3.6 by default, which is too old for Ansible 2.15+ on the target side. Set `ansible_python_interpreter` to a Python 3.7+ install, for example `python39` via `zypper`. |
+
+Container-based tests (`molecule`) additionally cover Ubuntu 22.04, Rocky Linux 9 and Rocky Linux 10,
+rotating both `root` and a non-root user.
 
 Other versions in the same families are likely to work, since nothing here relies on version-specific behaviour beyond what is called out above. They have not been explicitly verified.
 
@@ -91,22 +100,14 @@ Other versions in the same families are likely to work, since nothing here relie
 ansible-galaxy collection install krameff.ssh_key_rotation
 
 # From a tarball or directory
-ansible-galaxy collection install /path/to/krameff-ssh_key_rotation-1.0.0.tar.gz
+ansible-galaxy collection install /path/to/krameff-ssh_key_rotation-0.9.0.tar.gz
 ```
 
 ## Usage
 
-### Basic example
+New to this? [QUICKSTART.md](QUICKSTART.md) walks through a first rotation end to end.
 
-```bash
-ansible-playbook krameff.ssh_key_rotation.rotate \
-  -i inventory.ini \
-  -e "old_private_key=~/.ssh/id_old" \
-  -e "new_private_key=~/.ssh/pwc_id_ed25519" \
-  -e "new_public_key_file=./pwc_id_ed25519.pub" \
-  -e "old_public_key_file=./id_old.pub" \
-  --ask-become-pass
-```
+### Set up once
 
 The playbook runs against the `rotate` host group, which you define in your inventory:
 
@@ -117,35 +118,58 @@ prod-web-02 ansible_host=10.0.1.11
 prod-db-01 ansible_host=10.0.2.10
 ```
 
-### Disable password auth but keep keyboard-interactive
+Every rotation needs four paths, all on the control node. Keep them in a vars file rather than
+retyping four `-e` flags each time:
 
 ```bash
-ansible-playbook krameff.ssh_key_rotation.rotate \
-  -i inventory.ini \
-  -e old_private_key=~/.ssh/id_old \
-  -e new_private_key=~/.ssh/pwc_id_ed25519 \
-  -e new_public_key_file=./pwc_id_ed25519.pub \
-  -e old_public_key_file=./id_old.pub \
-  -e ssh_key_rotation_disable_password_auth=true \
-  -e ssh_key_rotation_disable_kbd_interactive=false
+cp rotation_vars.example.yml rotation_vars.yml   # then edit the four paths
 ```
 
-### Keep the old key in place as well as the new one
+```yaml
+old_private_key:     "~/.ssh/id_old"
+old_public_key_file: "~/.ssh/id_old.pub"
+new_private_key:     "./pwc_id_ed25519"
+new_public_key_file: "./pwc_id_ed25519.pub"
+```
+
+Your copy is gitignored. Everything in [Variables](#variables) can go in the same file.
+
+### Run it
 
 ```bash
 ansible-playbook krameff.ssh_key_rotation.rotate \
-  -i inventory.ini \
-  -e old_private_key=~/.ssh/id_old \
-  -e new_private_key=~/.ssh/pwc_id_ed25519 \
-  -e new_public_key_file=./pwc_id_ed25519.pub \
-  -e old_public_key_file=./id_old.pub \
-  -e ssh_key_rotation_make_exclusive=false \
-  -e ssh_key_rotation_disable_password_auth=true
+  -i inventory.ini -e @rotation_vars.yml --ask-become-pass
+```
+
+The four paths can still be passed as `-e old_private_key=...` if you prefer; the vars file is
+only a convenience.
+
+### Common variations
+
+Each of these is a line to add to `rotation_vars.yml`. Nothing else about the command changes.
+
+```yaml
+# Disable password auth but keep keyboard-interactive
+ssh_key_rotation_disable_password_auth: true
+ssh_key_rotation_disable_kbd_interactive: false
+
+# Keep the old key in place alongside the new one
+ssh_key_rotation_make_exclusive: false
+
+# Leave ONLY the new key in authorized_keys
+ssh_key_rotation_make_exclusive: true
+
+# Rotate a specific account rather than the inventory's ansible_user
+ssh_key_rotation_target_user: "ubuntu"
 ```
 
 ## Variables
 
+Any of these can go in `rotation_vars.yml` (see [Usage](#usage)) or be passed with `-e`.
+
 ### Required
+
+All four are paths on the **control node**, not on the targets.
 
 | Variable | Type | Description |
 |----------|------|-------------|
@@ -153,6 +177,10 @@ ansible-playbook krameff.ssh_key_rotation.rotate \
 | `new_private_key` | string | Path to the new SSH private key, on the control node |
 | `old_public_key_file` | string | Path to the old SSH public key, on the control node |
 | `new_public_key_file` | string | Path to the new SSH public key, on the control node |
+
+These have no defaults, deliberately. A default in `defaults/main.yml` would count as "defined"
+and permanently disable the Phase 0 check that catches a missing or misspelled path before any
+host is touched. Copy `rotation_vars.example.yml` instead.
 
 ### Optional
 
@@ -162,6 +190,11 @@ ansible-playbook krameff.ssh_key_rotation.rotate \
 | `ssh_key_rotation_disable_password_auth` | bool | `true` | Disable password authentication after rotation |
 | `ssh_key_rotation_disable_kbd_interactive` | bool | `true` | Disable keyboard-interactive auth after rotation |
 | `ssh_key_rotation_make_exclusive` | bool | `false` | Leave only the new key in `authorized_keys` |
+| `ssh_key_rotation_sshd_dropin_prefix` | string | `"99"` | Numeric prefix for this role's drop-ins. Lower wins. See [Drop-in overrides](#drop-in-overrides) |
+| `ssh_key_rotation_sshd_dropin_dir` | string | `/etc/ssh/sshd_config.d` | Where this role writes its configuration |
+| `ssh_key_rotation_manage_sshd_dropin` | bool | `false` | Deprecated: equivalent to a prefix of `01`, making this role outrank administrator drop-ins |
+| `ssh_key_rotation_rollback_remove_new_key` | bool | `false` | On rollback, also restore the pre-install `authorized_keys`, removing the new key |
+| `ssh_key_rotation_check_match_blocks` | bool | `true` | Check the lock-down applies to the rotated user specifically, catching a `Match` block that re-enables password auth for them |
 | `ssh_key_rotation_accepted_key_types` | list | `[ED25519, ED25519-SK, ECDSA, ECDSA-SK, RSA]` | Key types allowed for `new_public_key_file` |
 | `ssh_key_rotation_reject_key_types` | list | `[DSA]` | Key types that always fail validation, whatever the accepted list says |
 | `ssh_key_rotation_min_rsa_bits` | int | `3072` | Minimum RSA key size accepted |
@@ -169,7 +202,7 @@ ansible-playbook krameff.ssh_key_rotation.rotate \
 
 ### Optional, post-quantum
 
-All of these are empty or false by default, so none of them change existing behaviour unless you ask for them. See [PQC algorithm negotiation](#pqc-algorithm-negotiation).
+All of these are empty or false by default, so none of them change existing behaviour unless you ask for them. See [PQC.md](PQC.md).
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
@@ -204,127 +237,97 @@ This matters because a system-wide crypto-policy can quietly narrow what the Pha
 
 Without this check, Phase 1 would report success and Phase 2 would go on to remove the old key, leaving the host with no key it can actually authenticate with. The check runs, and can fail the host, before Phase 2 does anything destructive.
 
-## PQC algorithm negotiation
+## Post-quantum algorithms
 
-`ssh_key_rotation_pqc_key_types` only affects local key *type* recognition in Phase 0. It never changes what `sshd` and `ssh` actually negotiate on the wire.
+Opt-in, and off by default. The collection can enable post-quantum and hybrid key exchange and
+signature algorithms across the target's `sshd_config`, the RHEL/Fedora system-wide crypto-policy,
+and the control node's own ssh client.
 
-For a PQC or hybrid key to work end to end, both sides of the connection need matching algorithm lists across several independent layers. This collection can manage all of them:
+If you need it, it is all on one page: **[PQC.md](PQC.md)**. It covers the variables, where each
+piece runs across the three phases, and how `FIPS:PQ`-style crypto-policy modules work.
 
-| Variable | What it affects |
-|----------|-----------------|
-| `ssh_key_rotation_pqc_kex_algorithms` | `KexAlgorithms` in the target's `sshd_config`, and `-o KexAlgorithms` for this playbook's own connections |
-| `ssh_key_rotation_pqc_pubkey_algorithms` | `PubkeyAcceptedAlgorithms` and `HostKeyAlgorithms` in the target's `sshd_config`, and `-o PubkeyAcceptedAlgorithms` for this playbook's own connections |
-| `ssh_key_rotation_pqc_ca_signature_algorithms` | `CASignatureAlgorithms` in the target's `sshd_config`, for SSH CA setups only |
-| `ssh_key_rotation_manage_crypto_policy` | Whether the RHEL/Fedora system-wide crypto-policy is also managed, on the control node and on targets |
-| `ssh_key_rotation_crypto_policy_setting` | The value passed to `update-crypto-policies --set`, optionally combining a base policy with subpolicy modules using `BASE:MODULE` syntax, such as `DEFAULT:PQ` or `FIPS:PQ` |
-| `ssh_key_rotation_crypto_policy_add_modules` | Preferred over the setting above: adds modules onto a host's current policy instead of replacing it |
+Note that `ssh_key_rotation_pqc_key_types` only affects local key *type* recognition in Phase 0.
+It does not change what `sshd` and `ssh` actually negotiate on the wire; that needs the algorithm
+variables described in PQC.md.
 
-Every `sshd_config` directive is written with OpenSSH's `+algorithm` syntax, appending to the compiled-in defaults rather than replacing the list outright, so clients that do not speak PQC yet can still fall back to a classical algorithm.
+## Drop-in overrides
 
-### Where each piece runs
+Worth understanding before you rely on the lock-down, because the rule is the opposite of what
+most people assume.
 
-The diagram below splits the work by stage and by machine. See [Role reference](#role-reference) for how these map to `tasks/*.yml`.
+Every mainstream distribution now starts `/etc/ssh/sshd_config` with:
 
-```mermaid
-flowchart TD
-    subgraph P0["validate stage - control node, before any host is touched"]
-        Vars{"Any PQC algorithms requested?"}
-        Vars -->|"No"| Skip0["Nothing to do - skip straight to the install stage"]
-        Vars -->|"Yes"| ControlCheck{"Does the control node's own ssh support them?"}
-        ControlCheck -->|"No"| WarnLocal["Warn: negotiation may fail later"]
-        ControlCheck -->|"Yes"| ControlPolicy{"Also manage the control node's crypto-policy?"}
-        WarnLocal --> ControlPolicy
-        ControlPolicy -->|"Yes"| ControlModuleCheck{"Does the policy need a subpolicy module, e.g. FIPS:PQ?"}
-        ControlModuleCheck -->|"Yes"| ControlModuleGate["Fail now if that module isn't installed"]
-        ControlModuleCheck -->|"No"| ControlApply["Apply the crypto-policy"]
-        ControlModuleGate --> ControlApply
-        ControlPolicy -->|"No"| ExtraArgs
-        ControlApply --> ExtraArgs["Carry the algorithms into this playbook's own ssh connections"]
-    end
-
-    subgraph P1["install stage - target host, connected with the OLD key"]
-        SshdConfig["Add the algorithms to the target's sshd_config"]
-        SshdConfig --> TargetPolicy{"Also manage the target's crypto-policy?"}
-        TargetPolicy -->|"Yes"| TargetModuleCheck{"Does the policy need a subpolicy module?"}
-        TargetModuleCheck -->|"Yes"| TargetModuleGate["Fail now if that module isn't installed"]
-        TargetModuleCheck -->|"No"| TargetApply["Apply the crypto-policy"]
-        TargetModuleGate --> TargetApply
-        TargetApply --> RevalidateConfig["Re-check sshd_config is still valid"]
-        TargetPolicy -->|"No"| DropinCheck
-        RevalidateConfig --> DropinCheck["Warn about drop-in files/Match blocks that could override this"]
-        DropinCheck --> Reload["Reload sshd"]
-        Reload --> EffectiveCheck["Confirm the algorithms actually took effect"]
-    end
-
-    subgraph P2["verify stage - target host, reconnecting with the NEW key"]
-        Reconnect{"Does the new key authenticate over the new algorithms?"}
-        Reconnect -->|"No"| AbortVerify["Abort - old key and legacy auth left untouched"]
-        Reconnect -->|"Yes"| BackupVerify["Back up authorized_keys again"]
-        BackupVerify --> RemoveOldKey["Remove the OLD key from authorized_keys"]
-        RemoveOldKey --> Cleanup["Optionally disable password/keyboard-interactive auth"]
-    end
-
-    ExtraArgs --> SshdConfig
-    EffectiveCheck --> Reconnect
+```
+Include /etc/ssh/sshd_config.d/*.conf
 ```
 
-**On the control node, in Phase 0.** `ssh -Q kex` and `ssh -Q key-sig` confirm your own ssh binary can offer the algorithms you are asking for, before any host is touched. If `ssh_key_rotation_manage_crypto_policy` is set and this is a RHEL or Fedora control node, `update-crypto-policies --set` runs there too, so the machine's ssh *client* backend permits PQC algorithms system-wide. This is detected by checking whether the `update-crypto-policies` tool exists, not by an OS-family fact.
+and **sshd keeps the first value it sees for a keyword**. Not the last. Because the `Include`
+is at the top, a drop-in beats anything written further down the main file, and among drop-ins
+the lowest-sorting filename wins. Verified on Ubuntu 26.04: against a `50-cloud-init.conf`
+containing `PasswordAuthentication yes`, a `99-*.conf` setting it to `no` has no effect, while
+an `01-*.conf` does.
 
-**On the connection itself.** The algorithms need to travel with the Ansible connection. Rather than editing any file on the control node, Phases 1 and 2 compute an `ansible_ssh_extra_args` value that passes `-o KexAlgorithms=+...` and `-o PubkeyAcceptedAlgorithms=+...` for this playbook's connections only.
+This matters because Ubuntu cloud images ship exactly that `50-cloud-init.conf`. Editing only the
+main `sshd_config`, as this role does by default, leaves password login enabled on those hosts.
 
-**On the target, in Phase 1.** `KexAlgorithms`, `PubkeyAcceptedAlgorithms`, `HostKeyAlgorithms` and `CASignatureAlgorithms` are appended to `sshd_config`, using the same `lineinfile` plus `sshd -t` plus backup pattern used everywhere else.
+**This role writes drop-ins too, and never edits your `sshd_config`.** On any host with an
+`Include` line it writes two files:
 
-If `ssh_key_rotation_manage_crypto_policy` is set and the target has the tooling, the crypto-policy step runs there too. Because `update-crypto-policies --set` validates only its own module syntax and not the resulting merged `sshd_config`, there is an explicit `sshd -t` re-check afterwards, before the reload handler is allowed to fire. The drop-in warning also calls out `50-redhat.conf` by name, since that file is the generated crypto-policy backend include and is not meant to be hand-edited.
-
-Once `sshd` has reloaded, the `sshd -T` check flags any requested algorithm that still is not showing up in the effective config, so you find out before Phase 2 tries and fails to reconnect.
-
-### Combining a base policy with a subpolicy module
-
-`update-crypto-policies --set` accepts either a base policy name on its own (`DEFAULT`, `FIPS`, `LEGACY` and so on) or a base policy combined with one or more subpolicy *modules*, written as `BASE:MODULE`. For example `FIPS:PQ`, or `FIPS:PQ:NO-SHA1` to stack more than one.
-
-Each module is a `MODULE.pmod` file, either shipped by the OS under `/usr/share/crypto-policies/policies/modules/` or dropped in locally under `/etc/crypto-policies/policies/modules/`. A module is added on top of the base policy rather than replacing it, so `FIPS:PQ` stays FIPS-compliant everywhere else and only adds what `PQ.pmod` grants.
-
-This matters specifically for PQC. On AlmaLinux and RHEL 9, the `FIPS` policy alone includes no post-quantum key-exchange groups, but the OS still ships a built-in `PQ.pmod` that adds `mlkem768x25519-sha256` and other ML-KEM groups when combined as `FIPS:PQ`. This was confirmed against a real AlmaLinux 9.8 host, where `sshd -T` only showed `mlkem768x25519-sha256` in the effective `KexAlgorithms` after switching from `FIPS` to `FIPS:PQ`. AlmaLinux and RHEL 10 ship PQC key exchange in `FIPS` already, so the combination is not needed there.
-
-Before ever calling `update-crypto-policies --set`, the playbook lists whatever `*.pmod` files exist under both module directories on that host, the control node in Phase 0 and the target in Phase 1. If `ssh_key_rotation_crypto_policy_setting` names a module that is not present, it fails before making any change, rather than letting `update-crypto-policies` silently ignore an unknown module name or fail in a way that is easy to miss in the task output.
-
-### Example: enabling a PQC key-exchange algorithm
-
-```bash
-ansible-playbook krameff.ssh_key_rotation.rotate \
-  -i inventory.ini \
-  -e old_private_key=~/.ssh/id_old \
-  -e new_private_key=~/.ssh/pwc_id_ed25519 \
-  -e new_public_key_file=./pwc_id_ed25519.pub \
-  -e old_public_key_file=./id_old.pub \
-  -e '{"ssh_key_rotation_pqc_kex_algorithms": ["mlkem768x25519-sha256"]}'
+```
+/etc/ssh/sshd_config.d/99-ssh-key-rotation.conf           # install stage
+/etc/ssh/sshd_config.d/99-ssh-key-rotation-lockdown.conf  # verify stage
 ```
 
-### Example: RHEL/Fedora crypto-policy management
+Two files rather than one so that a verify-stage rollback cannot delete install-stage settings a
+previous run legitimately established. Hosts older than OpenSSH 8.2 have no `Include`, so there the
+role falls back to a marked block inside `sshd_config`, backed up first.
 
-```bash
-ansible-playbook krameff.ssh_key_rotation.rotate \
-  -i inventory.ini \
-  -e old_private_key=~/.ssh/id_old \
-  -e new_private_key=~/.ssh/pwc_id_ed25519 \
-  -e new_public_key_file=./pwc_id_ed25519.pub \
-  -e old_public_key_file=./id_old.pub \
-  -e ssh_key_rotation_manage_crypto_policy=true \
-  -e ssh_key_rotation_crypto_policy_setting=DEFAULT:PQ
+The `99-` default is chosen so **your** drop-ins still outrank this role's. That keeps your intent
+authoritative, and it is what lets Phase 2 detect a conflict and fail loudly rather than quietly
+working around you. If a drop-in of yours defeats the lock-down you have two options:
+
+**Fix the drop-in yourself** and re-run. Best when it is something you manage.
+
+**Let the role outrank it,** by lowering the prefix:
+
+```yaml
+ssh_key_rotation_sshd_dropin_prefix: "01"
 ```
 
-### Example: adding PQC to a FIPS-mode host
+Understand the trade before you do. At `01-` this role's files win, which also means the
+"lock-down did not take effect" check can no longer detect a conflicting drop-in - the role's file
+always wins, so the check becomes a formality. It is also why the role never manages
+`AuthorizedKeysFile`: at that precedence it would override a central key store such as
+`AuthorizedKeysFile /etc/ssh/authorized_keys/%u` and strip key access from every *other* user on
+the host, while the rotated user kept working. The role reads that setting and fails instead.
 
-```bash
-ansible-playbook krameff.ssh_key_rotation.rotate \
-  -i inventory.ini \
-  -e old_private_key=~/.ssh/id_old \
-  -e new_private_key=~/.ssh/pwc_id_ecdsa \
-  -e new_public_key_file=./pwc_id_ecdsa.pub \
-  -e old_public_key_file=./id_old.pub \
-  -e ssh_key_rotation_manage_crypto_policy=true \
-  -e ssh_key_rotation_crypto_policy_setting=FIPS:PQ
+### Match blocks
+
+A `Match` block is a separate problem with the same shape. `sshd -T` on its own reports the global
+configuration and does not evaluate `Match` at all, so a block like:
+
 ```
+Match User deploy
+    PasswordAuthentication yes
+```
+
+leaves password login working for exactly the account you just rotated, while the global check
+says it is disabled. Phase 2 therefore also runs `sshd -T -C user=<target>,...`, which does
+evaluate `Match`, and fails if password or keyboard-interactive auth is still enabled for that
+user. Turn it off with `ssh_key_rotation_check_match_blocks: false` if `sshd -T -C` misbehaves on
+your hosts.
+
+**The role never edits a `Match` block.** Everything it writes to `sshd_config` goes into two
+clearly marked blocks in the global section:
+
+```
+# BEGIN krameff.ssh_key_rotation install
+# BEGIN krameff.ssh_key_rotation lock-down
+```
+
+Both are anchored immediately after the `Include` line, or before the first `Match` on hosts with
+no `Include`. If a `Match` block contradicts what the role set, the role reports it and stops
+rather than editing someone's per-user policy. See [Limitations](#limitations).
 
 ## Safety model
 
@@ -338,11 +341,74 @@ The point of this playbook is that you should not be able to lock yourself out b
 
 Resetting the connection first matters if your `ansible.cfg` enables SSH `ControlPersist`. That multiplexes connections by host, port and user, not by identity file, so without the reset, Phase 2 could silently ride on Phase 1's still-open connection instead of genuinely testing the new key.
 
+**The lock-down is checked after the fact, not assumed.** `sshd_config` has `Include /etc/ssh/sshd_config.d/*.conf` at the top on every mainstream distribution, and sshd honours the *first* value it sees for a keyword. A drop-in therefore beats anything this playbook writes further down the file. Phase 2 re-reads `sshd -T` after its edits and fails, naming the problem, rather than reporting a lock-down that did not happen. This is a global check: `sshd -T` without `-C` does not evaluate `Match` blocks, which is why those get their own warning in Phase 1.
+
+**`authorized_keys` ownership is checked, on both the success and the rollback path.** sshd's `StrictModes` silently ignores an `authorized_keys` file that is not owned by the target user, which rejects every key at once. Because the playbook does its file work under `become`, ownership is set explicitly and then asserted.
+
+**Connectivity checks reconnect from scratch.** Every check that claims a key still works first resets the connection, so it cannot pass by riding an SSH `ControlPersist` session opened earlier in the run.
+
 **Every `sshd_config` change is validated with `sshd -t` before it is written.**
 
 **Configuration is applied with a reload, never a restart,** so sessions already open stay open.
 
 **`sshd_config` and `authorized_keys` are backed up before every edit,** so you can always roll back by hand.
+
+### What a failed run undoes
+
+```mermaid
+flowchart TD
+    Start["Rotation starts"] --> Record["Install records what it will change
+    in /etc/ansible/facts.d/ssh_key_rotation.fact"]
+    Record --> Install["Install: add the new key,
+    write this role's drop-in"]
+
+    Install --> InstallOK{"Install succeeded?"}
+    InstallOK -->|"No"| IRB["Install rollback:
+    remove this role's drop-in,
+    restore authorized_keys,
+    restore the crypto-policy"]
+    IRB --> IProbe["Prove the old key still logs in
+    (real ssh, no multiplexing)"]
+    IProbe --> Failed["Fail loudly, host as we found it"]
+
+    InstallOK -->|"Yes"| Gate{"Does the NEW key authenticate?"}
+    Gate -->|"No"| Abort["Abort - old key never touched"]
+    Gate -->|"Yes"| Verify["Verify: remove the old key,
+    write the lock-down drop-in"]
+
+    Verify --> VerifyOK{"Lock-down verified?
+    sshd -T, per-user Match check,
+    authorized_keys ownership"}
+    VerifyOK -->|"Yes"| Done["Done - rotation complete"]
+    VerifyOK -->|"No"| VRB["Verify rollback:
+    remove both drop-ins,
+    restore authorized_keys
+    (old key back, new key kept)"]
+    VRB --> VProbe["Prove access on a fresh,
+    unmultiplexed connection"]
+    VProbe --> Failed
+```
+
+Note what is *not* in the diagram: editing `/etc/ssh/sshd_config`. On any host with an `Include`
+line the role only ever adds and removes its own files, which is what makes "undo" a deletion
+rather than a restore.
+
+**A failed run puts the host back.** Both the install and the verify stage roll back their own
+changes: this role's drop-ins are removed (or restored, if a file was already at that path), and
+`authorized_keys` is restored from the backup taken before the run. What each stage actually did is
+recorded on the host at `/etc/ansible/facts.d/ssh_key_rotation.fact`, so the rollback undoes exactly
+that rather than guessing - and so it still works when the verify stage is run on its own.
+
+Two deliberate exceptions. The new key is **left** in `authorized_keys` by default: it is a
+credential you hold, and removing it would mean relying on the old key still working, which is not
+guaranteed. Set `ssh_key_rotation_rollback_remove_new_key: true` to restore the file exactly, in
+which case the old key is proven to work *before* anything is removed, and kept if that proof fails.
+The state file and the timestamped backups are also left behind, as the record of what happened.
+
+**Rollback proves access with a real SSH connection.** Not `ansible.builtin.ping`: Ansible
+multiplexes connections on host, port and user rather than on the identity file, so a ping can
+succeed over a socket opened with a different credential and report access that no longer exists.
+The check runs a real `ssh` with `ControlMaster=no` and `ControlPath=none`.
 
 **Phase 2's cleanup runs inside a `block`/`rescue`.** If removing the old key or disabling legacy auth fails partway through, `rescue` restores `authorized_keys` and `sshd_config` from the backups just taken, reloads sshd, re-confirms connectivity, and fails with a clear message. All of that happens on the same still-open connection, before it could be lost.
 
@@ -380,7 +446,9 @@ A reload that itself fails does not abort the rollback. The restored files are a
 7. Optionally make `authorized_keys` exclusive to the new key.
 8. Disable password and keyboard-interactive auth if requested, backing up `sshd_config` first.
 9. Apply the final sshd configuration.
-10. Run one last connectivity check.
+10. Re-read `sshd -T` and confirm password and keyboard-interactive auth really are disabled, failing if a drop-in overrode them.
+11. Confirm `authorized_keys` is still owned by the target user and not group- or world-writable, so sshd's `StrictModes` will honour it.
+12. Reset the connection and run one last connectivity check, so it re-authenticates rather than reusing the open session.
 
 ## Role reference
 
@@ -417,6 +485,50 @@ There is deliberately no `tasks/main.yml` entry point, because each stage authen
   tasks:
     - ansible.builtin.include_role: {name: ssh_key_rotation, tasks_from: verify}
 ```
+
+## Limitations
+
+Worth knowing before you rely on this in production. None of these cause silent failures: where
+the role cannot do something, it stops and says so rather than reporting a success it did not
+achieve.
+
+**`Match` blocks are never edited.** Everything written to `sshd_config` goes into two marked
+blocks in the global section. This is deliberate. A `Match` block is a per-user or per-address
+policy someone set on purpose, and `PubkeyAuthentication`, `AuthorizedKeysFile`,
+`PasswordAuthentication` and `PubkeyAcceptedAlgorithms` are all legal inside one. If a `Match`
+block contradicts the lock-down, Phase 2 fails and names it; fix the block by hand and re-run.
+
+**The `Match` check evaluates one connection profile, not all of them.** Phase 2 runs
+`sshd -T -C user=<target>,host=localhost,addr=<client address>`. That catches `Match User` and
+`Match Address` blocks affecting the rotation's own connection. A block keyed on something else,
+such as `Match LocalPort` or an address range the rotation did not come from, is not evaluated
+and could still apply to a future login.
+
+**Your drop-in files are never modified.** The role adds its own files under
+`/etc/ssh/sshd_config.d/` and removes them again on rollback, but it will not edit a drop-in you
+already have. If one at its own path already exists it is backed up and restored rather than
+deleted. See [Drop-in overrides](#drop-in-overrides).
+
+**Crypto-policy changes are not rolled back byte-for-byte.** `update-crypto-policies --set`
+regenerates `/etc/crypto-policies/back-ends/*`, so restoring the previous policy *name* does not
+restore files an administrator hand-edited underneath it. The control node's own policy, if
+`ssh_key_rotation_manage_crypto_policy` changed it, is not restored at all.
+
+**The state file is left on the host** at `/etc/ansible/facts.d/ssh_key_rotation.fact`, deliberately.
+It records what the last run changed, which is what makes a later recovery possible once the
+original connection is gone.
+
+**Only one account is rotated per run,** the one in `ssh_key_rotation_target_user`. Other users'
+`authorized_keys` files are untouched.
+
+**Recovery depends on the connection staying up.** Phase 2's rollback restores `authorized_keys`
+and `sshd_config` over the connection it already holds. If that connection is lost at the wrong
+moment, there is no remote path back in; you need console access. This is why the collection
+insists on proving the new key before removing the old one, and why a snapshot is worth taking.
+
+**`sshd -T` is trusted for verification.** Where a host's `sshd -T` cannot run at all, the
+lock-down checks are skipped with a warning rather than failing the run, since the alternative is
+rolling back a rotation that actually succeeded.
 
 ## Troubleshooting
 
@@ -457,11 +569,50 @@ Phase 2 could not connect with the new key. Things to check:
 
 ### "Drop-in sshd config files found"
 
-Phase 1 spotted override files in `/etc/ssh/sshd_config.d/`. Worth reviewing:
+A warning, not a failure. Phase 1 spotted override files in `/etc/ssh/sshd_config.d/`. Worth reviewing:
 
 1. See what is there: `ansible all -i inventory.ini -m ansible.builtin.find -a "paths=/etc/ssh/sshd_config.d patterns='*.conf'" -b`
 2. Make sure none of them re-enable `PasswordAuthentication yes` or similar.
-3. If needed, update the drop-ins by hand before running Phase 2, or pass `ssh_key_rotation_make_exclusive=false` to keep the old key active a little longer.
+3. If one does, fix it there before re-running. Phase 2 will fail rather than let it slide, as below.
+
+### "sshd -T still reports password authentication as ENABLED"
+
+Phase 2 disabled password auth in `/etc/ssh/sshd_config`, then re-read the effective config and
+found it still on, so it rolled back and failed. The lock-down did not take effect.
+
+Almost always a drop-in. `sshd_config` has `Include /etc/ssh/sshd_config.d/*.conf` at the top,
+and sshd uses the **first** value it sees for a keyword, so a drop-in beats anything written
+further down the main file. Ubuntu cloud images ship exactly this, as
+`50-cloud-init.conf` containing `PasswordAuthentication yes`.
+
+To fix, set the value in the winning drop-in, or remove it there, and re-run:
+
+```bash
+sudo grep -rn PasswordAuthentication /etc/ssh/sshd_config.d/
+sudo sshd -T | grep -i passwordauthentication   # what is actually in effect
+```
+
+The rotation itself succeeded before this check; the rollback put the old key and the previous
+`sshd_config` back, so the host is exactly as it started. If you would rather not disable
+password auth at all on these hosts, set `ssh_key_rotation_disable_password_auth: false` and the
+check is skipped with it.
+
+### "StrictModes will ignore this file, rejecting every key for this user"
+
+`~/.ssh/authorized_keys` is not owned by the user being rotated, or is group- or world-writable.
+sshd refuses to read such a file at all, so *every* key for that account stops working, not just
+the new one.
+
+The playbook sets ownership explicitly and asserts it, so seeing this means something else on the
+host changed it. Fix it directly:
+
+```bash
+sudo chown <user>:<group> ~<user>/.ssh/authorized_keys
+sudo chmod 600 ~<user>/.ssh/authorized_keys
+```
+
+Check the backups beside it too (`authorized_keys.bak-*`), since those are what a future rollback
+would restore from.
 
 ### PQC algorithms not negotiating
 
@@ -480,7 +631,7 @@ This is a hard stop before `update-crypto-policies --set` is ever called, on the
 
 1. List what is actually available: `ssh <host> ls /usr/share/crypto-policies/policies/modules/*.pmod /etc/crypto-policies/policies/modules/*.pmod`
 2. Check for typos in the module name, or drop a custom `MODULE.pmod` into `/etc/crypto-policies/policies/modules/` if you need one the OS does not ship.
-3. See [Combining a base policy with a subpolicy module](#combining-a-base-policy-with-a-subpolicy-module) for why `FIPS:PQ` is the combination most people want on RHEL and AlmaLinux 9.
+3. See [Combining a base policy with a subpolicy module](PQC.md#combining-a-base-policy-with-a-subpolicy-module) for why `FIPS:PQ` is the combination most people want on RHEL and AlmaLinux 9.
 
 ### "Permission denied" on Phase 1
 
@@ -508,12 +659,15 @@ Pipelining is the more robust fix, since some hardening baselines make every wri
 ansible-galaxy collection build .
 
 # Test against a local VM, brought up however you like
-ansible-playbook playbooks/rotate.yml -i 127.0.0.1, \
-  -e old_private_key=~/.ssh/id_rsa \
-  -e new_private_key=~/.ssh/id_ed25519 \
-  -e new_public_key_file=./id_ed25519.pub \
-  -e old_public_key_file=./id_rsa.pub
+ansible-playbook playbooks/rotate.yml -i 127.0.0.1, -e @rotation_vars.yml
+
+# Run the container test suites
+molecule test -s default    # full rotation, twice, proving idempotency
+molecule test -s nonroot    # same, rotating a non-root user
+molecule test -s rollback   # breaks a rotation mid-verify to prove access is restored
 ```
+
+See [DEVELOPMENT.md](DEVELOPMENT.md) for the repository layout and release process.
 
 ## Contributing
 

@@ -24,11 +24,13 @@ krameff-ssh_key_rotation/
 │   ├── ISSUE_TEMPLATE/     # Bug and feature forms; config.yml routes security reports privately
 │   └── workflows/
 │       ├── ci.yml          # Lint + syntax-check on push/PR
-│       ├── molecule.yml    # Functional Molecule tests (default + rollback) on push/PR, plus a weekly run
+│       ├── molecule.yml    # Functional Molecule tests (all 3 scenarios) on push/PR, plus a weekly run
 │       └── release.yml     # Builds and publishes to Galaxy on a v* tag
 ├── extensions/
 │   └── molecule/           # Molecule scenarios (the location current Molecule expects)
 │       ├── default/        # Full rotation over real SSH, twice, to also prove idempotency
+│       ├── nonroot/        # Same, rotating a non-root user, to catch file-ownership mistakes
+│       ├── resources/      # Shared prepare playbook and Dockerfile used by all scenarios
 │       └── rollback/       # Breaks a rotation mid-verify to prove the rescue block restores access
 ├── meta/
 │   └── runtime.yml         # Ansible version requirements
@@ -41,6 +43,7 @@ krameff-ssh_key_rotation/
 │       ├── meta/main.yml      # Role metadata (platforms, min Ansible version)
 │       └── tasks/
 │           ├── main.yml                  # Fails fast; this role has no default entry point, see below
+│           ├── resolve_sshd_anchor.yml    # Works out where the managed sshd_config blocks belong
 │           ├── validate.yml              # Phase 0: local pre-flight validation
 │           ├── install.yml               # Phase 1: install the new key, prepare sshd (connect via OLD key)
 │           ├── verify.yml                # Phase 2: verify the new key, then remove the old key/legacy auth
@@ -137,18 +140,28 @@ ansible-playbook -i inventory.ini playbooks/rotate.yml --check
 
 ### Molecule
 
-Two scenarios live under `extensions/molecule/`. They run against live containers (Ubuntu 22.04, Rocky Linux 9, Rocky Linux 10) with sshd installed and running.
+Three scenarios live under `extensions/molecule/`. They run against live containers (Ubuntu 22.04, Rocky Linux 9, Rocky Linux 10) with sshd installed and running.
 
 ```bash
 # Full rotation via playbooks/rotate.yml, run twice to also prove idempotency
 molecule test -s default
+
+# The same rotation, but against a non-root user whose primary group differs from its name
+molecule test -s nonroot
 
 # Runs the role's stages directly, breaking the second rotation mid-verify to prove the
 # block/rescue in roles/ssh_key_rotation/tasks/verify.yml actually restores access
 molecule test -s rollback
 ```
 
-Both scenarios generate their own ephemeral SSH keypairs and inventory into Molecule's per-run directory, so nothing needs to exist in the repository for them to run.
+All three generate their own ephemeral SSH keypairs and inventory into Molecule's per-run directory, so nothing needs to exist in the repository for them to run.
+
+`nonroot` and `rollback` rotate a non-root account on purpose. The role does its file work under
+`become`, so an `authorized_keys` it writes for a non-root user has to be chowned back explicitly;
+if it is not, sshd's `StrictModes` ignores the file and refuses every key. That failure is
+invisible when the target is `root`, because root-owned is then the correct result, so a root-only
+suite cannot catch it. `rollback` is the important one, since the bug's natural home is the
+`rescue` path.
 
 While iterating, avoid the full create-and-destroy cycle each time:
 
@@ -213,6 +226,11 @@ Keep generated keys out of the working tree. `.gitignore` covers the common patt
 
 The collection follows [Semantic Versioning](https://semver.org/):
 
+The collection is pre-1.0 and has not been released, so there is nothing published to stay
+compatible with. Until 1.0.0 ships, behaviour may change within `0.x` releases without a major
+bump; the changes are still written up in `CHANGELOG.md` so they are never a surprise. The scheme
+below applies from 1.0.0 onwards.
+
 - **Major** (1.0.0 to 2.0.0), for breaking changes: renamed or retyped variables, removed playbooks or features, or changed behaviour that could affect an existing workflow.
 - **Minor** (1.0.0 to 1.1.0), for backwards-compatible features: new playbooks or roles, new variables with sensible defaults, new optional capabilities.
 - **Patch** (1.0.0 to 1.0.1), for backwards-compatible fixes: configuration fixes, documentation fixes, small improvements that do not change behaviour.
@@ -225,7 +243,7 @@ New variables should default to off or empty, so that upgrading never changes wh
 
 ```bash
 ansible-galaxy collection build .
-# Output: ./krameff-ssh_key_rotation-1.0.0.tar.gz
+# Output: ./krameff-ssh_key_rotation-0.9.0.tar.gz
 ```
 
 `galaxy.yml`'s `build_ignore` keeps the Molecule scenarios, CI configuration, editor and agent directories, and any local inventory or key material out of the tarball.
@@ -239,7 +257,7 @@ So the order is: bump `version` in `galaxy.yml`, move the `Unreleased` changelog
 To publish by hand if you need to:
 
 ```bash
-ansible-galaxy collection publish ./krameff-ssh_key_rotation-1.0.0.tar.gz \
+ansible-galaxy collection publish ./krameff-ssh_key_rotation-0.9.0.tar.gz \
   --api-key <your-api-key>
 ```
 
