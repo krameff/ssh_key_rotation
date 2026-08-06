@@ -93,7 +93,7 @@ body:
     id: collection-version
     attributes:
       label: Collection version
-      placeholder: "1.0.0, or a commit SHA if installed from source"
+      placeholder: "0.9.0, or a commit SHA if installed from source"
     validations:
       required: true
 
