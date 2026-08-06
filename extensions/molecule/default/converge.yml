@@ -43,11 +43,17 @@
       changed_when: true
       register: ssh_key_rotation_second_run
 
-    # The three "Back up ..." tasks write to a dest containing ansible_date_time, so they produce a
-    # new file on every run and can never report changed=0. That's deliberate: each run must
-    # snapshot the state before that run, and reusing a fixed filename would overwrite the original
-    # pre-rotation backup. So they are expected to change, and anything else changing is a real
-    # idempotency regression - which is what this splits apart.
+    # Two kinds of task are expected to change on every run and are excluded here; anything else
+    # changing is a real idempotency regression, which is what this splits apart.
+    #
+    # "Back up ..." writes to a dest containing a timestamp, so it produces a new file each run.
+    # That is deliberate: each run must snapshot the state before that run, and a fixed filename
+    # would overwrite the original pre-rotation backup.
+    #
+    # "Write the rotation state fact" records run_id, a fresh timestamp per run, so its content
+    # differs every time by design. That file is what lets a rollback undo exactly what this run
+    # did, and what makes recovery possible after the connection is gone, so it cannot be made
+    # content-stable without losing the thing it is for.
     - name: Converge | Split the second run's changed tasks into expected backups vs unexpected
       vars:
         ssh_key_rotation_second_run_json: "{{ ssh_key_rotation_second_run.stdout | from_json }}"
@@ -57,7 +63,8 @@
           {%- for play in ssh_key_rotation_second_run_json.plays -%}
           {%-   for task in play.tasks -%}
           {%-     for host, result in task.hosts.items() -%}
-          {%-       if (result.changed | default(false)) and 'Back up' not in task.task.name -%}
+          {%-       if (result.changed | default(false)) and 'Back up' not in task.task.name
+                    and 'rotation state fact' not in task.task.name -%}
           {%-         set _ = found.append(task.task.name ~ ' on ' ~ host) -%}
           {%-       endif -%}
           {%-     endfor -%}
@@ -69,7 +76,8 @@
           {%- for play in ssh_key_rotation_second_run_json.plays -%}
           {%-   for task in play.tasks -%}
           {%-     for host, result in task.hosts.items() -%}
-          {%-       if (result.changed | default(false)) and 'Back up' in task.task.name -%}
+          {%-       if (result.changed | default(false)) and ('Back up' in task.task.name
+                    or 'rotation state fact' in task.task.name) -%}
           {%-         set _ = found.append(task.task.name) -%}
           {%-       endif -%}
           {%-     endfor -%}
