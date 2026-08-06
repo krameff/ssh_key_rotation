@@ -17,6 +17,7 @@ venv/
 .idea/
 .vscode/
 .cursor/
+.claude/
 *.iml
 .vagrant/
 *.log
