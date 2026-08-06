@@ -30,18 +30,76 @@
     - name: Verify | key_a authenticates over real SSH after the rollback
       ansible.builtin.command: >-
         ssh -i {{ ssh_key_rotation_test_dir }}/key_a {{ ssh_key_rotation_verify_ssh_opts }}
-        root@{{ ssh_key_rotation_verify_container_ip.stdout.split() | first }} true
+        {{ ssh_key_rotation_rollback_user }}@{{ ssh_key_rotation_verify_container_ip.stdout.split() | first }} true
       delegate_to: localhost
       changed_when: false
 
     - name: Verify | sshd is running
-      ansible.builtin.command: "systemctl is-active {{ ssh_key_rotation_sshd_service }}"
+      ansible.builtin.systemd_service:
+        name: "{{ ssh_key_rotation_sshd_service }}"
       become: true
-      changed_when: false
+      register: ssh_key_rotation_sshd_unit
+
+    - name: Verify | Assert sshd is still active after the rolled-back rotation
+      ansible.builtin.assert:
+        that: ssh_key_rotation_sshd_unit.status.ActiveState == 'active'
+        fail_msg: >-
+          {{ ssh_key_rotation_sshd_service }} is
+          {{ ssh_key_rotation_sshd_unit.status.ActiveState }}, not active, after the rollback.
+        success_msg: "{{ ssh_key_rotation_sshd_service }} is still active after the rollback."
+
+    # THE regression guard for the rescue path. The rollback restores authorized_keys with a copy
+    # running as root; if that copy does not chown the file back to the rotated user, sshd's
+    # StrictModes ignores it completely and refuses every key - a full lockout that still looks
+    # like a clean, successful rollback in the play recap. Checked before the content assertions
+    # below because restoring the right bytes with the wrong owner is still a locked-out host.
+    - name: Verify | Stat authorized_keys after the rolled-back rotation
+      ansible.builtin.stat:
+        path: "/home/{{ ssh_key_rotation_rollback_user }}/.ssh/authorized_keys"
+      register: ssh_key_rotation_rollback_ak_stat
+
+    - name: Verify | Rollback restored authorized_keys with the rotated user's ownership intact
+      ansible.builtin.assert:
+        that:
+          - ssh_key_rotation_rollback_ak_stat.stat.exists
+          - ssh_key_rotation_rollback_ak_stat.stat.pw_name == ssh_key_rotation_rollback_user
+          - not ssh_key_rotation_rollback_ak_stat.stat.wgrp
+          - not ssh_key_rotation_rollback_ak_stat.stat.woth
+        fail_msg: >-
+          After the rollback, authorized_keys is owned by
+          {{ ssh_key_rotation_rollback_ak_stat.stat.pw_name | default('(missing file)') }}
+          (mode {{ ssh_key_rotation_rollback_ak_stat.stat.mode | default('n/a') }}), not
+          {{ ssh_key_rotation_rollback_user }}. sshd StrictModes will ignore the file and refuse
+          every key - the rescue block restored the content but locked the user out.
+        success_msg: >-
+          Rollback restored authorized_keys still owned by {{ ssh_key_rotation_rollback_user }};
+          sshd StrictModes will honour it.
+
+    # Backups matter too: these are what a LATER rollback would restore from, so a root-owned
+    # backup is a lockout waiting to happen on the next failed rotation.
+    - name: Verify | Find the backups left behind by the rotations
+      ansible.builtin.find:
+        paths: "/home/{{ ssh_key_rotation_rollback_user }}/.ssh"
+        patterns: "authorized_keys.bak-*"
+      register: ssh_key_rotation_rollback_ak_backups
+
+    - name: Verify | Every authorized_keys backup is owned by the rotated user
+      ansible.builtin.assert:
+        that: >-
+          ssh_key_rotation_rollback_ak_backups.files
+          | rejectattr('pw_name', 'equalto', ssh_key_rotation_rollback_user) | list | length == 0
+        fail_msg: >-
+          These authorized_keys backups are not owned by {{ ssh_key_rotation_rollback_user }}:
+          {{ ssh_key_rotation_rollback_ak_backups.files
+             | rejectattr('pw_name', 'equalto', ssh_key_rotation_rollback_user)
+             | map(attribute='path') | list }}. Restoring one of these in a future rollback would
+          lock the user out.
+        success_msg: >-
+          All {{ ssh_key_rotation_rollback_ak_backups.files | length }} backup(s) are correctly owned.
 
     - name: Verify | Read authorized_keys after the failed rotation
       ansible.builtin.slurp:
-        src: /root/.ssh/authorized_keys
+        src: "/home/{{ ssh_key_rotation_rollback_user }}/.ssh/authorized_keys"
       register: ssh_key_rotation_post_failure_authorized_keys
 
     - name: Verify | Load the pre-failure checkpoint

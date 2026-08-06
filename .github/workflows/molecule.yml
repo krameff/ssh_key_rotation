@@ -20,7 +20,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        scenario: [default, rollback]
+        # nonroot is not a variant of default for its own sake: default and rollback both enter
+        # the containers as root and rotate root, so a file left owned by root is the correct
+        # outcome there and an ownership regression cannot fail them. nonroot is the only
+        # scenario that can catch it.
+        scenario: [default, rollback, nonroot]
     steps:
       - name: Check out repository
         uses: actions/checkout@v7

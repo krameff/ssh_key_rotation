@@ -19,6 +19,15 @@
 #                                   rotation_vars.yml, the single extra-vars file used by a
 #                                   converge that shells out to playbooks/rotate.yml. Scenarios
 #                                   that drive the role's stages directly don't need it.
+#   ssh_key_rotation_test_user      Unix user to rotate. Defaults to "root", which is what the
+#                                   containers are entered as. Set it to a non-root name to
+#                                   exercise the case the root-only scenarios structurally
+#                                   cannot: with become in play, the role's file operations run
+#                                   as root, so any authorized_keys it writes for a NON-root
+#                                   user must be explicitly chowned back. If it isn't, sshd's
+#                                   StrictModes ignores the file and every key is refused. That
+#                                   whole class of bug is invisible when target_user is root,
+#                                   because root-owned is then the correct outcome.
 
 - name: Prepare | Generate ephemeral keys and the test inventory on the control node
   hosts: localhost
@@ -52,7 +61,7 @@
           old_public_key_file: "{{ ssh_key_rotation_test_dir }}/{{ ssh_key_rotation_test_old }}.pub"
           new_private_key: "{{ ssh_key_rotation_test_dir }}/{{ ssh_key_rotation_test_new }}"
           new_public_key_file: "{{ ssh_key_rotation_test_dir }}/{{ ssh_key_rotation_test_new }}.pub"
-          ssh_key_rotation_target_user: root
+          ssh_key_rotation_target_user: {{ ssh_key_rotation_test_user | default('root') }}
 
 - name: Prepare | Seed the pre-existing key into each container's authorized_keys
   hosts: rotate
@@ -76,9 +85,36 @@
         line: 'PermitRootLogin prohibit-password'
       notify: Restart sshd for prepare
 
+    # Only for non-root scenarios. Given its own primary group deliberately named differently
+    # from the username, so the role cannot get ownership right by assuming group == user.
+    - name: Prepare | Create the non-root rotation target group
+      when: (ssh_key_rotation_test_user | default('root')) != 'root'
+      ansible.builtin.group:
+        name: "{{ ssh_key_rotation_test_user }}grp"
+        state: present
+
+    - name: Prepare | Create the non-root rotation target user
+      when: (ssh_key_rotation_test_user | default('root')) != 'root'
+      ansible.builtin.user:
+        name: "{{ ssh_key_rotation_test_user }}"
+        group: "{{ ssh_key_rotation_test_user }}grp"
+        shell: /bin/bash
+        create_home: true
+        state: present
+
+    # The role needs become to edit sshd_config; the rotation user must therefore be able to
+    # sudo without a password, exactly as a real managed account would be.
+    - name: Prepare | Grant the non-root rotation target passwordless sudo
+      when: (ssh_key_rotation_test_user | default('root')) != 'root'
+      ansible.builtin.copy:
+        dest: "/etc/sudoers.d/90-{{ ssh_key_rotation_test_user }}-molecule"
+        content: "{{ ssh_key_rotation_test_user }} ALL=(ALL) NOPASSWD:ALL\n"  # pragma: allowlist secret
+        mode: "0440"
+        validate: "visudo -cf %s"
+
     - name: Prepare | Install the ephemeral seed public key as pre-existing authorized access
       ansible.posix.authorized_key:
-        user: root
+        user: "{{ ssh_key_rotation_test_user | default('root') }}"
         key: "{{ lookup('file', ssh_key_rotation_test_dir + '/' + ssh_key_rotation_test_seed_key + '.pub') }}"
         state: present
 
@@ -91,26 +127,62 @@
       ansible.builtin.set_fact:
         ssh_key_rotation_container_ip: "{{ ssh_key_rotation_container_ip.stdout.split() | first }}"
 
-    - name: Prepare | Ensure the [rotate] group header is present in the generated inventory
-      ansible.builtin.lineinfile:
-        path: "{{ ssh_key_rotation_test_dir }}/rotation_inventory.ini"
-        line: "[rotate]"
-        insertbefore: BOF
-        create: true
+    # Written once, from hostvars, instead of each host appending its own line with lineinfile.
+    # That earlier approach had every host in the group read-modify-write the SAME file on the
+    # control node concurrently (delegate_to: localhost, default forks), so a host's line could
+    # be lost to a classic lost-update race. The symptom was silent and dangerous: the dropped
+    # container was still created and seeded, but never rotated or verified, and the suite still
+    # reported success - a regression affecting only that platform would pass CI unnoticed.
+    - name: Prepare | Write the generated rotation inventory in a single pass
+      vars:
+        # Split out purely to keep the generated line below within the linter's length limit;
+        # each entry still has to render as ONE line of INI.
+        ssh_key_rotation_inv_user: "{{ ssh_key_rotation_test_user | default('root') }}"
+        ssh_key_rotation_inv_ssh_args: >-
+          -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+      ansible.builtin.copy:
+        dest: "{{ ssh_key_rotation_test_dir }}/rotation_inventory.ini"
         mode: "0600"
+        content: |
+          [rotate]
+          {% for host in ansible_play_hosts | sort %}
+          {{ host }} ansible_host={{ hostvars[host].ssh_key_rotation_container_ip }}
+          {{- ' ansible_user=' ~ ssh_key_rotation_inv_user }}
+          {{- " ansible_ssh_common_args='" ~ ssh_key_rotation_inv_ssh_args ~ "'" }}
+          {% endfor %}
+          {% if (ssh_key_rotation_test_user | default('root')) != 'root' %}
+
+          [rotate:vars]
+          ansible_become=true
+          ansible_become_method=sudo
+          {% endif %}
       delegate_to: localhost
       run_once: true
 
-    - name: Prepare | Append this host to the generated rotation inventory
-      ansible.builtin.lineinfile:
-        path: "{{ ssh_key_rotation_test_dir }}/rotation_inventory.ini"
-        create: true
-        mode: "0600"
-        line: >-
-          {{ inventory_hostname }} ansible_host={{ ssh_key_rotation_container_ip }} ansible_user=root
-          ansible_ssh_common_args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
-        insertafter: EOF
+    # The two host lists differ on purpose, which is what gives this assert something real to
+    # catch: the file above is written from ansible_play_hosts (hosts STILL ACTIVE), while this
+    # compares against ansible_play_hosts_all (every host Molecule created). A container that
+    # failed an earlier prepare task - the user or sudoers tasks above, say - drops out of the
+    # former but not the latter, so it would be silently omitted from the rotation inventory and
+    # never rotated, while the suite still reported success. Comparing the file against the same
+    # variable it was generated from would be a tautology that can never fail.
+    - name: Prepare | Assert every created host made it into the generated inventory
+      vars:
+        ssh_key_rotation_inventory_hosts: >-
+          {{ lookup('file', ssh_key_rotation_test_dir + '/rotation_inventory.ini')
+             | regex_findall('(?m)^(\S+)\s+ansible_host=') }}
+      ansible.builtin.assert:
+        that: ssh_key_rotation_inventory_hosts | sort == ansible_play_hosts_all | sort
+        fail_msg: >-
+          Generated rotation inventory lists {{ ssh_key_rotation_inventory_hosts | sort }}
+          but Molecule created {{ ansible_play_hosts_all | sort }}. The missing host(s) either
+          failed a prepare task or were lost while writing the file; either way they would be
+          seeded but never rotated, and the suite would still pass.
+        success_msg: >-
+          All {{ ansible_play_hosts_all | length }} created host(s) are present in the
+          generated rotation inventory.
       delegate_to: localhost
+      run_once: true
 
   handlers:
     - name: Restart sshd for prepare
