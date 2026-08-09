@@ -17,6 +17,7 @@ venv/
 .idea/
 .vscode/
 .cursor/
+.claude/
 *.iml
 .vagrant/
 *.log
@@ -39,3 +40,10 @@ pwc_id_*
 *.pem
 authorized_keys.bak-*
 test_vars.yml
+test_*
+*_ecdsa*
+*_ed25519*
+!*.pub.example
+
+# Personal copy of rotation_vars.example.yml; contains local key paths, not for committing.
+rotation_vars.yml

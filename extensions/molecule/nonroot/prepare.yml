@@ -1,0 +1,26 @@
+---
+
+# Same shape as the default scenario, but rotates a NON-root user. That difference is the whole
+# point of this scenario: the other scenarios enter the containers as root and rotate root, so
+# "the file ended up owned by root" is the correct result there and any ownership bug is
+# invisible. With a non-root target the role still does its file work under become (as root),
+# so every authorized_keys it writes or restores must be explicitly chowned back to the target
+# user - otherwise sshd's StrictModes ignores the file and refuses every key for that user.
+#
+# The user's primary group is deliberately NOT the same name as the user (see resources/prepare.yml),
+# so the role cannot pass by assuming group == username.
+
+- name: Prepare | Set up the containers as non-root rotation targets
+  ansible.builtin.import_playbook: ../resources/prepare.yml
+  vars:
+    ssh_key_rotation_test_user: svcrotate
+    ssh_key_rotation_test_keys:
+      - name: old_key
+        type: rsa
+        bits: 3072
+      - name: new_key
+        type: ed25519
+    ssh_key_rotation_test_seed_key: old_key
+    ssh_key_rotation_test_rotation_vars:
+      old: old_key
+      new: new_key

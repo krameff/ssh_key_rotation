@@ -11,7 +11,7 @@
   gather_facts: false
   vars:
     ssh_key_rotation_test_dir: "{{ lookup('env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}"
-    ssh_key_rotation_repo_root: "{{ playbook_dir }}/../../.."
+    ssh_key_rotation_repo_root: "{{ lookup('env', 'MOLECULE_PROJECT_DIRECTORY') }}"
   tasks:
     - name: Converge | First rotation run
       ansible.builtin.command: >-

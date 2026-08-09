@@ -6,6 +6,28 @@
 - name: Verify | New KEY | Gather facts
   ansible.builtin.setup:
 
+- name: Verify | Resolve the target user's primary group
+  ansible.builtin.include_tasks: resolve_target_identity.yml
+
+- name: Verify | Decide how this host's sshd will be configured
+  ansible.builtin.include_tasks: resolve_sshd_strategy.yml
+
+# Read from the host, not carried over from the install play. This is what lets the rollback below
+# undo the INSTALL stage's changes too, and what keeps the verify stage usable standalone. Anything
+# missing or malformed is treated as "no install state", which degrades to rolling back only this
+# stage's changes rather than erroring inside a rescue.
+- name: Verify | Read the rotation state the install stage recorded on this host
+  ansible.builtin.include_tasks: state_read.yml
+
+- name: Verify | Warn when no install-stage state was found
+  when: ssh_key_rotation_recorded | length == 0
+  ansible.builtin.debug:
+    msg: >-
+      No rotation state found at /etc/ansible/facts.d/ssh_key_rotation.fact on this host. If the
+      verify stage fails, its rollback will undo only the changes this stage made - install-stage
+      changes (the new key in authorized_keys, and this role's install drop-in) will be left in
+      place. That is expected when the verify stage is run on its own.
+
 # Hard safety gate: if the new key can't authenticate, this fails the host and nothing below (the destructive part) executes.
 - name: Verify | New KEY | Confirm the host is reachable
   ansible.builtin.ping:
@@ -25,9 +47,11 @@
     - name: Verify | New KEY | Back up authorized_keys before removing the old key
       ansible.builtin.copy:
         src: "~{{ ssh_key_rotation_target_user }}/.ssh/authorized_keys"
-        dest: "~{{ ssh_key_rotation_target_user }}/.ssh/authorized_keys.bak-{{ ansible_date_time.iso8601_basic_short }}"
+        dest: "~{{ ssh_key_rotation_target_user }}/.ssh/authorized_keys.bak-{{ ansible_facts.date_time.iso8601_basic_short }}"
         remote_src: true
         mode: preserve
+        owner: "{{ ssh_key_rotation_target_user }}"
+        group: "{{ ssh_key_rotation_target_group }}"
       register: ssh_key_rotation_authorized_keys_backup
 
     - name: Verify | New KEY | Remove the OLD public key from authorized_keys
@@ -44,35 +68,64 @@
         state: present
         exclusive: true
 
-    # Explicit, deterministically-named backup (same pattern as authorized_keys above), so rescue: below
-    # knows exactly which file to restore, rather than chasing lineinfile's own auto-named backup files.
-    - name: Verify | Back up sshd_config before disabling legacy auth
-      when: (ssh_key_rotation_disable_password_auth | bool) or (ssh_key_rotation_disable_kbd_interactive | bool)
+    # Written to its own drop-in, separate from the install stage's file. Two files rather than one
+    # on purpose: this stage's rescue deletes the lock-down file, and on a re-run after a previously
+    # successful install that would otherwise also delete PQC algorithms an earlier run legitimately
+    # established - which, for a client that can only negotiate those algorithms, is itself a
+    # lockout. Separate files also cannot collide on the same keyword.
+    - name: Verify | Write the lock-down settings to a drop-in
+      when:
+        - ssh_key_rotation_use_dropin | bool
+        - (ssh_key_rotation_disable_password_auth | bool) or (ssh_key_rotation_disable_kbd_interactive | bool)
+      ansible.builtin.include_tasks: sshd_dropin_write.yml
+      vars:
+        ssh_key_rotation_dropin_name: ssh-key-rotation-lockdown.conf
+        ssh_key_rotation_dropin_key: lockdown
+        ssh_key_rotation_dropin_content: |
+          # Managed by krameff.ssh_key_rotation (verify stage). Safe to remove; this role rewrites it.
+          {% if ssh_key_rotation_disable_password_auth | bool %}
+          PasswordAuthentication no
+          {% endif %}
+          {% if ssh_key_rotation_disable_kbd_interactive | bool %}
+          KbdInteractiveAuthentication no
+          {% endif %}
+
+    # Pre-OpenSSH-8.2 fallback only: no Include support, so the main file must be edited. Backed up
+    # first, and anchored to the global section so the edit can never land inside a Match block.
+    - name: Verify | Back up sshd_config before editing it on a host without drop-in support
+      when:
+        - not (ssh_key_rotation_use_dropin | bool)
+        - (ssh_key_rotation_disable_password_auth | bool) or (ssh_key_rotation_disable_kbd_interactive | bool)
       ansible.builtin.copy:
         src: /etc/ssh/sshd_config
-        dest: "/etc/ssh/sshd_config.bak-{{ ansible_date_time.iso8601_basic_short }}"
+        dest: "/etc/ssh/sshd_config.bak-{{ ansible_facts.date_time.iso8601_basic_short }}"
         remote_src: true
         mode: preserve
       become: true
       register: ssh_key_rotation_sshd_config_backup
 
-    - name: Verify | Disable password authentication (the old way of connecting)
-      when: ssh_key_rotation_disable_password_auth | bool
-      ansible.builtin.lineinfile:
-        path: /etc/ssh/sshd_config
-        regexp: '^#?\s*PasswordAuthentication'
-        line: 'PasswordAuthentication no'
-        validate: 'sshd -t -f %s'
-        backup: true
-      become: true
-      notify: Reload sshd
+    - name: Verify | Work out where the managed lock-down block belongs
+      when:
+        - not (ssh_key_rotation_use_dropin | bool)
+        - (ssh_key_rotation_disable_password_auth | bool) or (ssh_key_rotation_disable_kbd_interactive | bool)
+      ansible.builtin.include_tasks: resolve_sshd_anchor.yml
 
-    - name: Verify | Disable keyboard-interactive authentication
-      when: ssh_key_rotation_disable_kbd_interactive | bool
-      ansible.builtin.lineinfile:
+    - name: Verify | Disable password and keyboard-interactive auth in the global section
+      when:
+        - not (ssh_key_rotation_use_dropin | bool)
+        - (ssh_key_rotation_disable_password_auth | bool) or (ssh_key_rotation_disable_kbd_interactive | bool)
+      ansible.builtin.blockinfile:
         path: /etc/ssh/sshd_config
-        regexp: '^#?\s*KbdInteractiveAuthentication'
-        line: 'KbdInteractiveAuthentication no'
+        marker: "# {mark} krameff.ssh_key_rotation lock-down"
+        insertafter: "{{ ssh_key_rotation_block_after | default(omit, true) }}"
+        insertbefore: "{{ ssh_key_rotation_block_before | default(omit, true) }}"
+        block: |
+          {% if ssh_key_rotation_disable_password_auth | bool %}
+          PasswordAuthentication no
+          {% endif %}
+          {% if ssh_key_rotation_disable_kbd_interactive | bool %}
+          KbdInteractiveAuthentication no
+          {% endif %}
         validate: 'sshd -t -f %s'
         backup: true
       become: true
@@ -81,22 +134,243 @@
     - name: Verify | Apply final sshd changes
       ansible.builtin.meta: flush_handlers
 
+    # Asserted rather than assumed: the tasks above only edit the GLOBAL section of the main
+    # sshd_config, but sshd reads `Include /etc/ssh/sshd_config.d/*.conf` (placed at the TOP of
+    # the file on Debian/Ubuntu and RHEL alike) and takes the FIRST value it sees for each
+    # keyword. A drop-in such as cloud-init's 50-cloud-init.conf therefore wins outright, and
+    # the lineinfile tasks still report "changed" while the setting never takes effect. Without
+    # this check the role reports a successful lock-down on a host where password login still works.
+    # failed_when: false, and every assertion below gated on rc == 0, deliberately mirroring the
+    # same call in install.yml. `sshd -T` is a diagnostic here, not the thing being changed: it
+    # legitimately exits non-zero on hosts where it cannot load host keys, or where the binary
+    # isn't on the become shell's PATH. Letting it fail hard at this point - AFTER the old key
+    # has been removed - would trigger the rollback and undo a rotation that actually succeeded,
+    # which is strictly worse than not being able to run the check.
+    - name: Verify | Re-read the effective sshd configuration after lock-down
+      ansible.builtin.command: sshd -T
+      become: true
+      changed_when: false
+      failed_when: false
+      register: ssh_key_rotation_sshd_effective_after_lockdown
+
+    - name: Verify | Warn if the effective sshd configuration could not be read back
+      when: ssh_key_rotation_sshd_effective_after_lockdown.rc != 0
+      ansible.builtin.debug:
+        msg: >-
+          `sshd -T` exited {{ ssh_key_rotation_sshd_effective_after_lockdown.rc }}
+          ({{ ssh_key_rotation_sshd_effective_after_lockdown.stderr | default('no stderr') | trim }}),
+          so this run could NOT confirm that password/keyboard-interactive authentication are
+          actually disabled. The sshd_config edits were applied and validated, but a drop-in under
+          /etc/ssh/sshd_config.d/ may still override them - verify manually on this host.
+
+    # Scoped to the global section: `sshd -T` without -C reports global values, so a Match block
+    # that re-enables password auth for some user still passes this. install.yml already warns
+    # when Match blocks are present; this check closes the drop-in hole, not the Match one.
+    - name: Verify | Assert password authentication is actually disabled
+      when:
+        - ssh_key_rotation_disable_password_auth | bool
+        - ssh_key_rotation_sshd_effective_after_lockdown.rc == 0
+      ansible.builtin.assert:
+        that: ssh_key_rotation_sshd_effective_after_lockdown.stdout is search('(?im)^passwordauthentication\s+no$')
+        fail_msg: >-
+          sshd -T still reports password authentication as ENABLED after this role disabled it in
+          /etc/ssh/sshd_config. A drop-in under /etc/ssh/sshd_config.d/ almost certainly overrides
+          it - sshd honours the FIRST value for a keyword and the Include sits at the top of the
+          main config. Set PasswordAuthentication no in the winning drop-in (or remove it there),
+          then re-run. Failing here rather than reporting a lock-down that did not happen.
+        success_msg: >-
+          Password authentication is confirmed disabled in sshd's global effective configuration.
+
+    # Accepts either spelling: KbdInteractiveAuthentication only exists from OpenSSH 8.7, and
+    # older releases still shipped by supported EL versions report the setting under its previous
+    # name, ChallengeResponseAuthentication. Matching only the new name would fail this assert on
+    # a correctly locked-down host - after the old key was already removed.
+    - name: Verify | Assert keyboard-interactive authentication is actually disabled
+      when:
+        - ssh_key_rotation_disable_kbd_interactive | bool
+        - ssh_key_rotation_sshd_effective_after_lockdown.rc == 0
+      ansible.builtin.assert:
+        that: >-
+          ssh_key_rotation_sshd_effective_after_lockdown.stdout is search('(?im)^kbdinteractiveauthentication\s+no$')
+          or ssh_key_rotation_sshd_effective_after_lockdown.stdout is search('(?im)^challengeresponseauthentication\s+no$')
+        fail_msg: >-
+          sshd -T still reports keyboard-interactive authentication as ENABLED after this role
+          disabled it (checked as both KbdInteractiveAuthentication and the pre-OpenSSH-8.7 name
+          ChallengeResponseAuthentication). As above, check for an overriding drop-in under
+          /etc/ssh/sshd_config.d/.
+        success_msg: "Keyboard-interactive authentication is confirmed disabled in sshd's effective configuration."
+
+    # The checks above read the GLOBAL config: `sshd -T` without -C does not evaluate Match blocks
+    # at all. A `Match User <target>` block re-enabling password auth for exactly the account being
+    # rotated therefore passes them while that account can still log in with a password. Verified
+    # on Rocky 9.8: with a global `PasswordAuthentication no` plus `Match User vagrant` setting it
+    # back to yes, `sshd -T` reports no and `sshd -T -C user=vagrant,...` reports yes.
+    #
+    # The connect spec uses the real client address from SSH_CONNECTION where available, so
+    # `Match Address`/`Match Host` blocks are evaluated against the address this rotation actually
+    # came from rather than a placeholder.
+    - name: Verify | Determine the client address for the per-user sshd check
+      when: ssh_key_rotation_check_match_blocks | bool
+      ansible.builtin.set_fact:
+        ssh_key_rotation_client_addr: >-
+          {{ (ansible_facts.env.SSH_CONNECTION | default('')).split(' ') | first | default('', true) or '0.0.0.0' }}
+
+    # failed_when: false - `sshd -T -C` is a diagnostic, and this runs AFTER the old key is gone.
+    # Some builds reject the connect spec (or -C outright), and failing hard there would roll back
+    # a rotation that actually succeeded. An unusable check warns; a check that runs and finds
+    # password auth still live for this user is a hard failure.
+    - name: Verify | Re-read the effective sshd configuration for the rotated user specifically
+      when: ssh_key_rotation_check_match_blocks | bool
+      ansible.builtin.command: >-
+        sshd -T -C user={{ ssh_key_rotation_target_user | quote }},host=localhost,addr={{ ssh_key_rotation_client_addr | quote }}
+      become: true
+      changed_when: false
+      failed_when: false
+      register: ssh_key_rotation_sshd_effective_for_user
+
+    - name: Verify | Warn if the per-user sshd configuration could not be read
+      when:
+        - ssh_key_rotation_check_match_blocks | bool
+        - ssh_key_rotation_sshd_effective_for_user.rc != 0
+      ansible.builtin.debug:
+        msg: >-
+          `sshd -T -C` exited {{ ssh_key_rotation_sshd_effective_for_user.rc }}
+          ({{ ssh_key_rotation_sshd_effective_for_user.stderr | default('no stderr') | trim }}),
+          so Match blocks could NOT be evaluated for {{ ssh_key_rotation_target_user }}. The global
+          configuration was verified, but a `Match User {{ ssh_key_rotation_target_user }}` block
+          could still re-enable password login for this account. Check by hand with:
+          sshd -T -C user={{ ssh_key_rotation_target_user }},host=localhost,addr=1.2.3.4
+
+    - name: Verify | Assert no Match block re-enables password auth for the rotated user
+      when:
+        - ssh_key_rotation_check_match_blocks | bool
+        - ssh_key_rotation_disable_password_auth | bool
+        - ssh_key_rotation_sshd_effective_for_user.rc == 0
+      ansible.builtin.assert:
+        that: ssh_key_rotation_sshd_effective_for_user.stdout is search('(?im)^passwordauthentication\s+no$')
+        fail_msg: >-
+          Password authentication is disabled globally but STILL ENABLED for
+          {{ ssh_key_rotation_target_user }}, so a Match block in sshd_config re-enables it for
+          exactly the account just rotated. This role only edits the global section and never
+          touches Match blocks. Remove or amend the block, then re-run. Find it with:
+          grep -n Match /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf
+        success_msg: >-
+          Password authentication is confirmed disabled for {{ ssh_key_rotation_target_user }}
+          specifically, so no Match block re-enables it.
+
+    - name: Verify | Assert no Match block re-enables keyboard-interactive auth for the rotated user
+      when:
+        - ssh_key_rotation_check_match_blocks | bool
+        - ssh_key_rotation_disable_kbd_interactive | bool
+        - ssh_key_rotation_sshd_effective_for_user.rc == 0
+      ansible.builtin.assert:
+        that: >-
+          ssh_key_rotation_sshd_effective_for_user.stdout is search('(?im)^kbdinteractiveauthentication\s+no$')
+          or ssh_key_rotation_sshd_effective_for_user.stdout is search('(?im)^challengeresponseauthentication\s+no$')
+        fail_msg: >-
+          Keyboard-interactive authentication is disabled globally but STILL ENABLED for
+          {{ ssh_key_rotation_target_user }}, so a Match block re-enables it for that account.
+          Remove or amend the block, then re-run.
+        success_msg: >-
+          Keyboard-interactive authentication is confirmed disabled for
+          {{ ssh_key_rotation_target_user }} specifically.
+
+    # authorized_keys must be owned by the target user: sshd's StrictModes (enabled by default)
+    # silently IGNORES the file otherwise, which would reject every key at once.
+    - name: Verify | Confirm authorized_keys ownership still satisfies sshd StrictModes
+      ansible.builtin.stat:
+        path: "~{{ ssh_key_rotation_target_user }}/.ssh/authorized_keys"
+      register: ssh_key_rotation_authorized_keys_final_stat
+
+    - name: Verify | Assert authorized_keys is owned by the target user and not group/world writable
+      ansible.builtin.assert:
+        that:
+          - ssh_key_rotation_authorized_keys_final_stat.stat.exists
+          - ssh_key_rotation_authorized_keys_final_stat.stat.pw_name == ssh_key_rotation_target_user
+          - not ssh_key_rotation_authorized_keys_final_stat.stat.wgrp
+          - not ssh_key_rotation_authorized_keys_final_stat.stat.woth
+        fail_msg: >-
+          ~{{ ssh_key_rotation_target_user }}/.ssh/authorized_keys is owned by
+          {{ ssh_key_rotation_authorized_keys_final_stat.stat.pw_name | default('(missing file)') }}
+          with mode {{ ssh_key_rotation_authorized_keys_final_stat.stat.mode | default('n/a') }}.
+          sshd's StrictModes will ignore this file entirely, rejecting every key for this user.
+        success_msg: "authorized_keys ownership and permissions satisfy sshd StrictModes."
+
+    # The connection opened earlier in this play is multiplexed (ControlPersist), so a plain ping
+    # here would succeed over the EXISTING socket and prove nothing about the lock-down just
+    # applied. Dropping the connection first makes the check below a real re-authentication.
+    - name: Verify | Drop the multiplexed connection so the final check re-authenticates
+      ansible.builtin.meta: reset_connection
+
     - name: Verify | Final connectivity check with the NEW key after lock-down
       ansible.builtin.ping:
 
   rescue:
-    # Guarded with `is succeeded`, not just `is defined`: if the very first task above (the backup itself)
-    # is what failed, nothing has actually changed yet, so there's nothing to restore.
-    - name: Rollback | Restore authorized_keys from the pre-cleanup backup
-      when: ssh_key_rotation_authorized_keys_backup is succeeded
+    # Order here is deliberate and safety-critical.
+    #
+    # Configuration is undone first, because that cannot cost anyone access: removing this role's
+    # drop-ins can only restore the host's previous behaviour. Key material is touched last, and
+    # only after proving the credential we would fall back to actually works.
+    #
+    # Everything is driven from the state the install stage recorded on the HOST, not from
+    # variables registered in an earlier play. An undefined variable inside a rescue: aborts the
+    # rescue, which would leave a half-changed host with no rollback at all - strictly worse than
+    # having none. Hence `| default(...)` on every lookup.
+
+    # Re-read first. The snapshot taken at the start of this stage predates the lock-down drop-in
+    # being recorded, so rolling back from it would leave that file behind - undoing everything
+    # except the setting this stage exists to apply.
+    - name: Rollback | Re-read the recorded state so it includes this stage's own changes
+      ansible.builtin.include_tasks: state_read.yml
+
+    - name: Rollback | Remove this stage's lock-down drop-in
+      when: (ssh_key_rotation_recorded.dropins | default({})).lockdown is defined
+      ansible.builtin.file:
+        path: "{{ ssh_key_rotation_recorded.dropins.lockdown.path }}"
+        state: absent
+      become: true
+      register: ssh_key_rotation_rollback_lockdown_removed
+
+    - name: Rollback | Restore a lock-down drop-in that existed before this run
+      when:
+        - (ssh_key_rotation_recorded.dropins | default({})).lockdown is defined
+        - ssh_key_rotation_recorded.dropins.lockdown.backup | default(none) is not none
       ansible.builtin.copy:
-        src: "{{ ssh_key_rotation_authorized_keys_backup.dest }}"
-        dest: "~{{ ssh_key_rotation_target_user }}/.ssh/authorized_keys"
+        src: "{{ ssh_key_rotation_recorded.dropins.lockdown.backup }}"
+        dest: "{{ ssh_key_rotation_recorded.dropins.lockdown.path }}"
         remote_src: true
         mode: preserve
+      become: true
 
-    - name: Rollback | Restore sshd_config from the pre-cleanup backup
-      when: ssh_key_rotation_sshd_config_backup is defined and ssh_key_rotation_sshd_config_backup is succeeded
+    # Only when THIS run created it. A drop-in that already existed belongs to the administrator,
+    # and deleting it would destroy configuration this role never owned.
+    - name: Rollback | Remove the install stage's drop-in if this run created it
+      when:
+        - (ssh_key_rotation_recorded.dropins | default({})).install is defined
+        - ssh_key_rotation_recorded.dropins.install.created_by_role | default(false) | bool
+      ansible.builtin.file:
+        path: "{{ ssh_key_rotation_recorded.dropins.install.path }}"
+        state: absent
+      become: true
+      register: ssh_key_rotation_rollback_install_removed
+
+    - name: Rollback | Restore an install drop-in that existed before this run
+      when:
+        - (ssh_key_rotation_recorded.dropins | default({})).install is defined
+        - ssh_key_rotation_recorded.dropins.install.backup | default(none) is not none
+      ansible.builtin.copy:
+        src: "{{ ssh_key_rotation_recorded.dropins.install.backup }}"
+        dest: "{{ ssh_key_rotation_recorded.dropins.install.path }}"
+        remote_src: true
+        mode: preserve
+      become: true
+
+    # Pre-8.2 hosts only, where the main file had to be edited rather than a drop-in written.
+    - name: Rollback | Restore sshd_config on a host without drop-in support
+      # `.dest is defined`, not `is succeeded`: a SKIPPED task result also satisfies `is succeeded`,
+      # so the old guard passed on drop-in hosts where this backup never ran, and referencing .dest
+      # raised inside the rescue - aborting the rescue and cancelling the whole rollback.
+      when: ssh_key_rotation_sshd_config_backup.dest | default(none) is not none
       ansible.builtin.copy:
         src: "{{ ssh_key_rotation_sshd_config_backup.dest }}"
         dest: /etc/ssh/sshd_config
@@ -104,15 +378,15 @@
         mode: preserve
       become: true
 
-    # A failed reload must not abort the rollback. authorized_keys and sshd_config are already
-    # restored on disk above, and sshd reads authorized_keys per-connection, so access is back even
-    # if the daemon never re-read its config. rescue: has no rescue of its own, so letting this fail
-    # would skip the two tasks that matter most here: the connectivity check below (the real access
-    # gate) and the diagnostic that tells the operator what was restored. Reported in that message
-    # instead. Note the reload can fail for the very same reason the block did - both use
-    # ssh_key_rotation_sshd_service - so this is the expected path, not an edge case.
-    - name: Rollback | Reload sshd with the restored configuration
-      when: ssh_key_rotation_sshd_config_backup is defined and ssh_key_rotation_sshd_config_backup is succeeded
+    # Only if a configuration file actually changed. authorized_keys needs no reload at all - sshd
+    # reads it per new connection - so a reload here is about config only. Skipping it when nothing
+    # changed also avoids the old wart where the rollback's reload failed for the very same reason
+    # the block did.
+    - name: Rollback | Reload sshd only if its configuration was actually changed back
+      when: >-
+        (ssh_key_rotation_rollback_lockdown_removed is defined and ssh_key_rotation_rollback_lockdown_removed is changed)
+        or (ssh_key_rotation_rollback_install_removed is defined and ssh_key_rotation_rollback_install_removed is changed)
+        or (ssh_key_rotation_sshd_config_backup.dest | default(none) is not none)
       ansible.builtin.service:
         name: "{{ ssh_key_rotation_sshd_service }}"
         state: reloaded
@@ -120,25 +394,164 @@
       register: ssh_key_rotation_rollback_reload
       ignore_errors: true
 
-    # Stays fatal on purpose: this is what proves access survived the rollback.
-    - name: Rollback | Confirm connectivity still works after rollback
-      ansible.builtin.ping:
+    # The old key is proven to work BEFORE anything is removed from authorized_keys. Restoring the
+    # pre-install file deletes the new key, and if the old key then turns out not to work - a
+    # previous run used make_exclusive, the key is passphrase-protected, or a crypto policy no
+    # longer accepts its algorithm - that would delete the last usable credential from a host we
+    # are still connected to, with the multiplexed session hiding it until it drops.
+    # Restoring the pre-install file is what puts the OLD key back: this stage removed it before
+    # failing, and leaving it removed is not "as we found it".
+    #
+    # Deliberately NOT gated on probing the old key first. That ordering is circular - the old key
+    # has already been removed by this point, so a probe of it cannot succeed, and gating on it
+    # meant the restore never ran. The restore is safe without it: the new key is put straight back
+    # alongside the old one below, so the host is never left with fewer credentials than it had a
+    # moment earlier. sshd reads authorized_keys per new connection, so an established session is
+    # unaffected either way.
+    - name: Rollback | Restore the pre-install authorized_keys
+      when: (ssh_key_rotation_recorded.authorized_keys | default({})).backup | default(none) is not none
+      ansible.builtin.copy:
+        src: "{{ ssh_key_rotation_recorded.authorized_keys.backup }}"
+        dest: "~{{ ssh_key_rotation_target_user }}/.ssh/authorized_keys"
+        remote_src: true
+        mode: preserve
+        owner: "{{ ssh_key_rotation_target_user }}"
+        group: "{{ ssh_key_rotation_recorded.target_group | default(ssh_key_rotation_target_group) }}"
+      become: true
+      register: ssh_key_rotation_rollback_ak_restored
 
-    - name: Rollback | Fail with details of what was automatically restored
+    # Default: old key back AND new key kept. Removing the new key would leave the host depending
+    # solely on the old key working, which is not guaranteed - a previous run may have used
+    # make_exclusive, the key may be passphrase-protected, or a crypto policy may no longer accept
+    # its algorithm. Keeping both means the rollback cannot cost anyone access.
+    - name: Rollback | Put the new key back alongside the restored old key
+      when:
+        - not (ssh_key_rotation_rollback_remove_new_key | bool)
+        - ssh_key_rotation_rollback_ak_restored is defined and ssh_key_rotation_rollback_ak_restored is changed
+      ansible.posix.authorized_key:
+        user: "{{ ssh_key_rotation_target_user }}"
+        key: "{{ lookup('file', new_public_key_file) }}"
+        state: present
+        exclusive: false
+      become: true
+
+    # Safety net for the exact-restore mode: if the old key turns out not to work, the host would
+    # now have no usable credential at all, so the new key goes back regardless of the setting.
+    - name: Rollback | Check the old key works when the new key was deliberately removed
+      when:
+        - ssh_key_rotation_rollback_remove_new_key | bool
+        - ssh_key_rotation_rollback_ak_restored is defined and ssh_key_rotation_rollback_ak_restored is changed
+        - old_private_key is defined
+      ansible.builtin.include_tasks: probe_key.yml
+      vars:
+        ssh_key_rotation_probe_key: "{{ old_private_key }}"
+        ssh_key_rotation_probe_label: old key
+        ssh_key_rotation_probe_required: false
+
+    - name: Rollback | Re-install the new key because the old key could not authenticate
+      when:
+        - ssh_key_rotation_rollback_remove_new_key | bool
+        - ssh_key_rotation_rollback_ak_restored is defined and ssh_key_rotation_rollback_ak_restored is changed
+        - ssh_key_rotation_probe_result is defined and ssh_key_rotation_probe_result.rc != 0
+      ansible.posix.authorized_key:
+        user: "{{ ssh_key_rotation_target_user }}"
+        key: "{{ lookup('file', new_public_key_file) }}"
+        state: present
+        exclusive: false
+      become: true
+      register: ssh_key_rotation_rollback_new_key_readded
+
+    # StrictModes gate: sshd silently IGNORES an authorized_keys not owned by the target user,
+    # refusing every key for that account. A restore that gets ownership wrong is itself a lockout,
+    # so this is checked rather than assumed.
+    - name: Rollback | Confirm authorized_keys ownership after any restore
+      ansible.builtin.stat:
+        path: "~{{ ssh_key_rotation_target_user }}/.ssh/authorized_keys"
+      register: ssh_key_rotation_rollback_ak_stat
+
+    - name: Rollback | Warn if authorized_keys ownership would defeat sshd StrictModes
+      when: >-
+        (not ssh_key_rotation_rollback_ak_stat.stat.exists)
+        or ssh_key_rotation_rollback_ak_stat.stat.pw_name != ssh_key_rotation_target_user
+        or ssh_key_rotation_rollback_ak_stat.stat.wgrp or ssh_key_rotation_rollback_ak_stat.stat.woth
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: ~{{ ssh_key_rotation_target_user }}/.ssh/authorized_keys is owned by
+          {{ ssh_key_rotation_rollback_ak_stat.stat.pw_name | default('(missing file)') }} with mode
+          {{ ssh_key_rotation_rollback_ak_stat.stat.mode | default('n/a') }}. sshd StrictModes will
+          ignore it and refuse every key for this user. Fix ownership before closing your session.
+
+    # The final proof, and deliberately NOT ansible.builtin.ping. Ansible's ControlPath is keyed on
+    # host/port/user, not on the identity file, so a ping can succeed over a socket opened with a
+    # different credential and report access that no longer exists. probe_key.yml drives a real ssh
+    # client with ControlMaster=no and ControlPath=none, so its exit code means what it says.
+    # Which private key is available depends on how the role was invoked: playbooks/rotate.yml
+    # supplies both, but a caller driving the stages directly with tasks_from may set neither.
+    # Referencing an undefined one here would raise INSIDE the rescue, which aborts the rescue and
+    # cancels the rollback - the exact failure this whole design exists to avoid. So the key is
+    # chosen from what is actually defined, and the proof is skipped with a warning if neither is.
+    - name: Rollback | Choose a private key to prove access with
+      ansible.builtin.set_fact:
+        ssh_key_rotation_rollback_probe_key: >-
+          {{ old_private_key
+             if (old_private_key is defined
+                 and ssh_key_rotation_rollback_ak_restored is defined
+                 and ssh_key_rotation_rollback_ak_restored is changed)
+             else (new_private_key if new_private_key is defined
+                   else (old_private_key if old_private_key is defined else '')) }}
+
+    - name: Rollback | Prove a usable credential still authenticates after the rollback
+      when: ssh_key_rotation_rollback_probe_key | length > 0
+      ansible.builtin.include_tasks: probe_key.yml
+      vars:
+        ssh_key_rotation_probe_key: "{{ ssh_key_rotation_rollback_probe_key }}"
+        ssh_key_rotation_probe_label: restored credential
+        ssh_key_rotation_probe_required: false
+
+    - name: Rollback | Warn when no private key was available to prove access with
+      when: ssh_key_rotation_rollback_probe_key | length == 0
+      ansible.builtin.debug:
+        msg: >-
+          Neither old_private_key nor new_private_key is defined, so access could NOT be re-proven
+          after the rollback. The configuration changes were undone, but verify by hand that you can
+          still log in to this host before closing your session.
+
+    - name: Rollback | Record the rollback in the host's rotation state
+      ansible.builtin.include_tasks: state_write.yml
+      vars:
+        ssh_key_rotation_state:
+          stage: verify-rolled-back
+
+    - name: Rollback | Fail with details of what was automatically undone
       ansible.builtin.fail:
         msg: >-
           Verify stage failed partway through cleanup and was automatically rolled back.
           Original error: {{ ansible_failed_result.msg | default(ansible_failed_result) }}.
-          Restored authorized_keys from
-          {{ ssh_key_rotation_authorized_keys_backup.dest | default('n/a - nothing had changed yet') }}
-          {{ ('and sshd_config from ' + ssh_key_rotation_sshd_config_backup.dest)
-             if (ssh_key_rotation_sshd_config_backup is defined and ssh_key_rotation_sshd_config_backup is succeeded)
-             else '(sshd_config was not touched)' }}.
-          The old key and prior sshd_config are back in place; nothing was left half-changed.
+          {{ ('CRITICAL: after rolling back, NO credential could authenticate on a fresh connection'
+              ~ ' (ssh exited ' ~ (ssh_key_rotation_probe_result.rc | default('unknown') | string)
+              ~ ': ' ~ (ssh_key_rotation_probe_result.stderr | default('') | trim)
+              ~ '). Do not close existing sessions; recover via console if needed.')
+             if (ssh_key_rotation_rollback_probe_key | default('') | length > 0
+                 and (ssh_key_rotation_probe_result is not defined or ssh_key_rotation_probe_result.rc != 0))
+             else ('Access was re-proven on a fresh, unmultiplexed connection after the rollback.'
+                   if (ssh_key_rotation_rollback_probe_key | default('') | length > 0)
+                   else 'No private key was available to re-prove access; verify by hand.') }}
+          {{ ("This role's drop-ins were removed, so its configuration changes are fully undone.")
+             if (ssh_key_rotation_recorded.dropins is defined) else
+             ('sshd_config was restored from ' ~ (ssh_key_rotation_sshd_config_backup.dest | default('n/a', true))) }}
+          {{ ('authorized_keys was restored, so the old key works again; the new key was deliberately'
+              ~ ' left alongside it, since removing it would leave the host depending solely on the'
+              ~ ' old key. Set ssh_key_rotation_rollback_remove_new_key=true for the exact pre-install file.')
+             if (ssh_key_rotation_rollback_ak_restored is defined
+                 and ssh_key_rotation_rollback_ak_restored is changed
+                 and not (ssh_key_rotation_rollback_remove_new_key | bool))
+             else ('authorized_keys was restored to its exact pre-install contents; the new key is no longer installed.'
+                   if (ssh_key_rotation_rollback_ak_restored is defined and ssh_key_rotation_rollback_ak_restored is changed)
+                   else 'authorized_keys was NOT restored - no pre-install backup was recorded, or the old key could not be proven to work - so the new key was left in place as the only usable credential.') }}
           {{ ('WARNING: sshd could not be reloaded during the rollback ('
               ~ (ssh_key_rotation_rollback_reload.msg | default('unknown error'))
-              ~ ') - the restored sshd_config is on disk but is NOT yet active. Reload or restart'
-              ~ ' sshd manually to activate it. Key-based access is unaffected, since sshd reads'
-              ~ ' authorized_keys per connection.')
+              ~ ') - the restored configuration is on disk but is NOT yet active. Reload or restart'
+              ~ ' sshd manually. Key-based access is unaffected, since sshd reads authorized_keys'
+              ~ ' per connection.')
              if (ssh_key_rotation_rollback_reload is defined and ssh_key_rotation_rollback_reload is failed)
              else '' }}

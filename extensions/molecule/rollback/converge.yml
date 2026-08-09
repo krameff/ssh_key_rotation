@@ -42,7 +42,7 @@
     new_private_key: "{{ ssh_key_rotation_test_dir }}/key_a"
     new_public_key_file: "{{ ssh_key_rotation_test_dir }}/key_a.pub"
     ansible_ssh_private_key_file: "{{ old_private_key }}"
-    ssh_key_rotation_target_user: root
+    ssh_key_rotation_target_user: "{{ ssh_key_rotation_rollback_user }}"
   tasks:
     - name: Converge | Run role install stage
       ansible.builtin.include_role:
@@ -58,7 +58,7 @@
     new_private_key: "{{ ssh_key_rotation_test_dir }}/key_a"
     new_public_key_file: "{{ ssh_key_rotation_test_dir }}/key_a.pub"
     ansible_ssh_private_key_file: "{{ new_private_key }}"
-    ssh_key_rotation_target_user: root
+    ssh_key_rotation_target_user: "{{ ssh_key_rotation_rollback_user }}"
     ssh_key_rotation_disable_password_auth: false
     ssh_key_rotation_disable_kbd_interactive: false
   tasks:
@@ -76,7 +76,7 @@
   tasks:
     - name: Converge | Read authorized_keys after rotation 1
       ansible.builtin.slurp:
-        src: /root/.ssh/authorized_keys
+        src: "/home/{{ ssh_key_rotation_rollback_user }}/.ssh/authorized_keys"
       register: ssh_key_rotation_checkpoint_authorized_keys
 
     - name: Converge | Save the authorized_keys checkpoint locally
@@ -96,7 +96,7 @@
     new_private_key: "{{ ssh_key_rotation_test_dir }}/key_b"
     new_public_key_file: "{{ ssh_key_rotation_test_dir }}/key_b.pub"
     ansible_ssh_private_key_file: "{{ old_private_key }}"
-    ssh_key_rotation_target_user: root
+    ssh_key_rotation_target_user: "{{ ssh_key_rotation_rollback_user }}"
   tasks:
     - name: Converge | Run role install stage
       ansible.builtin.include_role:
@@ -112,7 +112,7 @@
     new_private_key: "{{ ssh_key_rotation_test_dir }}/key_b"
     new_public_key_file: "{{ ssh_key_rotation_test_dir }}/key_b.pub"
     ansible_ssh_private_key_file: "{{ new_private_key }}"
-    ssh_key_rotation_target_user: root
+    ssh_key_rotation_target_user: "{{ ssh_key_rotation_rollback_user }}"
     ssh_key_rotation_sshd_service: "bogus-sshd-molecule-test"
   tasks:
     # block/rescue, not `ignore_errors` + `register` on the include_role: ignore_errors does NOT

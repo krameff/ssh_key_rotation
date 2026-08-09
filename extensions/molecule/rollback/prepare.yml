@@ -10,6 +10,9 @@
 - name: Prepare | Set up the containers as rotation targets
   ansible.builtin.import_playbook: ../resources/prepare.yml
   vars:
+    # Must match ssh_key_rotation_rollback_user in this scenario's molecule.yml. Non-root on
+    # purpose - see the comment there for why the rescue path can only be tested this way.
+    ssh_key_rotation_test_user: svcrotate
     ssh_key_rotation_test_keys:
       - name: seed_key
         type: rsa

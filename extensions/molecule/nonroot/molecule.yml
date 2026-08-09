@@ -7,7 +7,7 @@ platforms:
   # override only name/image. The Dockerfile itself is shared across scenarios too, hence the
   # relative path (the docker driver resolves `dockerfile` against this scenario directory).
   - &platform_defaults
-    name: ssh-key-rotation-rollback-ubuntu2204
+    name: ssh-key-rotation-nonroot-ubuntu2204
     image: geerlingguy/docker-ubuntu2204-ansible:latest
     dockerfile: ../resources/Dockerfile.j2
     command: /usr/sbin/init
@@ -22,10 +22,10 @@ platforms:
     groups:
       - rotate
   - <<: *platform_defaults
-    name: ssh-key-rotation-rollback-rockylinux9
+    name: ssh-key-rotation-nonroot-rockylinux9
     image: geerlingguy/docker-rockylinux9-ansible:latest
   - <<: *platform_defaults
-    name: ssh-key-rotation-rollback-rockylinux10
+    name: ssh-key-rotation-nonroot-rockylinux10
     image: geerlingguy/docker-rockylinux10-ansible:latest
 dependency:
   # Mirrors exactly what CI used to run as a separate step, so a local `molecule test` and a
@@ -36,7 +36,9 @@ dependency:
 provisioner:
   name: ansible
   env:
-    # converge.yml includes the role by its bare name, so this has to be right. Two traps:
+    # This scenario's converge shells out to playbooks/rotate.yml with its own absolute roles
+    # path, so nothing here strictly needs this today. It is set anyway to keep both scenarios
+    # identical and to stay correct if a play here ever includes the role directly. Two traps:
     # the collection's own ansible.cfg (roles_path = ./roles) is NOT consulted, because
     # Molecule generates its own ansible.cfg and points ANSIBLE_CONFIG at it; and Molecule
     # runs with the project directory as cwd, not the scenario directory, so a
@@ -60,22 +62,12 @@ provisioner:
         # rockylinux9: "PAM account management error: Authentication service cannot retrieve
         # authentication info"), which has nothing to do with what these tests are proving.
         ansible_user: root
-      # The Unix account this scenario rotates. Deliberately NOT root: the rescue block restores
-      # authorized_keys while running under become (as root), so if that restore does not chown
-      # the file back, sshd's StrictModes ignores it and every key is refused - the rollback that
-      # exists to preserve access becomes the thing that destroys it. With a root target that bug
-      # is invisible, because root-owned is then the correct result. This is the only scenario
-      # that drives the rescue path, so it is the only place that regression can be caught.
-      # Note the containers are still ENTERED as root above (that is Molecule's own connection);
-      # only the rotation target differs.
-      all:
-        ssh_key_rotation_rollback_user: svcrotate
 scenario:
   test_sequence:
     - dependency
     # Leading destroy: without it a container left behind by an aborted run is reused, and its
-    # authorized_keys already holds keys from that run. That silently breaks this suite's core
-    # premise (only the seeded key is authorized before converge runs).
+    # authorized_keys already holds the rotated-in key. That silently breaks this suite's core
+    # premise (only the seeded old key is authorized before converge runs).
     - destroy
     - syntax
     - create

@@ -1,5 +1,12 @@
 ---
 
+# The four required variables - old_private_key, old_public_key_file, new_private_key and
+# new_public_key_file - are deliberately absent from this file. They have no safe default: any
+# value here would count as "defined" and permanently disable the validate stage's check that
+# catches a missing or misspelled path before a single host is touched. Set them per run, either
+# with -e or by copying rotation_vars.example.yml and passing -e @rotation_vars.yml. See
+# README.md's Variables section for the full list.
+
 # Default shell to be used for shell commands
 # Could be overridden by inventory etc
 ssh_key_rotation_os_default_shell: "/bin/bash"
@@ -42,6 +49,47 @@ ssh_key_rotation_key_type_signature_algorithms:
 ssh_key_rotation_disable_password_auth: true   # disable password login = "the old way of connecting"
 ssh_key_rotation_disable_kbd_interactive: true
 ssh_key_rotation_make_exclusive: false         # set true to leave ONLY the new key in authorized_keys
+
+# Where this role writes its own configuration. On any host with an `Include` line (OpenSSH 8.2+,
+# which is every currently supported distribution) the role writes drop-ins here and NEVER edits
+# /etc/ssh/sshd_config, so rolling back is deleting a file rather than restoring someone else's
+# config. Hosts with no Include fall back to a marked block in the main file.
+ssh_key_rotation_sshd_dropin_dir: /etc/ssh/sshd_config.d
+
+# The numeric prefix is load-bearing, and lower means stronger. sshd keeps the FIRST value it sees
+# for a keyword and the Include sits at the TOP of sshd_config, so ordering runs: earlier drop-in >
+# later drop-in > main file body. Verified on Ubuntu 26.04 (99-* loses to 50-cloud-init.conf, 01-*
+# beats it) and Rocky 9.8 (99-* still beats the main file body).
+#
+# 99 is the deliberate default: it overrides the main file, but an administrator's own drop-in
+# still wins. That keeps their intent authoritative and leaves the verify stage's lock-down check
+# able to detect the conflict and fail loudly. Set 01 to override admin drop-ins instead - see the
+# warning on ssh_key_rotation_manage_sshd_dropin below before you do.
+ssh_key_rotation_sshd_dropin_prefix: "99"
+
+# DEPRECATED, honoured for compatibility: equivalent to setting the prefix to "01". Two things to
+# understand before enabling it. First, it makes this role outrank administrator drop-ins, which
+# also makes the "lock-down did not take effect" check a tautology - the role's file always wins,
+# so a conflicting drop-in can no longer be detected. Second, it is why this role does NOT manage
+# AuthorizedKeysFile: at this precedence, overriding a central key store such as
+# `AuthorizedKeysFile /etc/ssh/authorized_keys/%u` would strip key access from every OTHER user on
+# the host while the rotated user kept working, so the run would report success having locked out
+# the rest of the estate.
+ssh_key_rotation_manage_sshd_dropin: false
+
+# Rollback restores the host's configuration, but by default LEAVES the new key in authorized_keys
+# rather than restoring the pre-install file. That is a deliberate deviation from "pristine": the
+# operator already holds that key so it is no third-party exposure, and removing it means relying
+# on the old key still working - which is not guaranteed if a previous run used make_exclusive, or
+# the key is passphrase-protected, or a crypto policy no longer accepts its algorithm. Set true to
+# restore the pre-install authorized_keys exactly; the rollback then proves the old key
+# authenticates BEFORE removing anything, and keeps the new key if that proof fails.
+ssh_key_rotation_rollback_remove_new_key: false
+
+# Checks the lock-down actually applies to the user being rotated, via `sshd -T -C`, not just
+# globally: a `Match User` block can re-enable password auth for exactly that account while the
+# global config reports it disabled. Set false only if `sshd -T -C` misbehaves on your hosts.
+ssh_key_rotation_check_match_blocks: true
 
 # Common to install/verify stages; same user on both ends of the rotation.
 ssh_key_rotation_target_user: "{{ ansible_user | default(lookup('env', 'USER')) }}"
