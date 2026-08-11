@@ -1,8 +1,31 @@
 # Changelog
 
-## [Unreleased]
+## [0.9.0] - 2026-08-11
+
+First release. Nothing was published before this, so the entries below record how the
+collection was built rather than changes to anything anyone was running. If you are
+picking it up for the first time, the README describes the shipped behaviour directly.
 
 ### Added
+
+#### Core rotation
+
+- Three-stage key rotation via a proper role: install the new key, verify it works, then remove the old key and disable legacy auth.
+- Cross-OS support for Debian/Ubuntu and RHEL/Fedora-family hosts, zero-downtime (reload not restart).
+- Pre-flight validation of key paths, new key type/size, and key pair match, before touching any host.
+- Install stage hard-fails if `sshd -T` will not actually accept the new key's algorithm, parsing `PubkeyAcceptedAlgorithms` rather than matching a substring of the output.
+- New-key authentication checks force `meta: reset_connection` first, so a stale multiplexed connection opened with the old key cannot make the check meaningless.
+- `Match` block detection in `sshd_config`.
+- Automatic backup of `authorized_keys` and `sshd_config` before every edit.
+- Automatic rollback in the verify stage if old-key removal or auth cleanup fails.
+- Stricter old-key validation (files exist, key parses); warns if old and new keys are identical.
+- Opt-in PQC/hybrid algorithm negotiation (off by default), plus RHEL/Fedora crypto-policy management, including the `BASE:MODULE` syntax (e.g. `FIPS:PQ`) with a check that the module exists first. See [PQC.md](PQC.md).
+- `ssh_key_rotation_pqc_key_types` allowlist slot, reserved for future PQC key types.
+- All role variables use an `ssh_key_rotation_` prefix.
+- `ansible.cfg`, so the role is found locally without installing the collection.
+- `.gitignore` excludes generated private keys.
+
+#### Release and project files
 
 - Release workflow: tagging `v*` builds the collection and publishes it to Galaxy, needs a `GALAXY_API_KEY` secret.
 - Release workflow fails the build if the tag doesn't match the version in `galaxy.yml`.
@@ -41,7 +64,7 @@
 
 ### Changed
 
-- On any host with an `Include` line (OpenSSH 8.2+, so every currently supported distribution) the role writes its settings to drop-ins under `/etc/ssh/sshd_config.d/` and no longer edits `/etc/ssh/sshd_config` at all, so rolling back is deleting a file rather than restoring someone else's config. Two files are used - one per stage - so a verify-stage rollback cannot delete install-stage settings an earlier run established. Older hosts keep the marked-block behaviour, backed up first. This does add files to `/etc/ssh/sshd_config.d/`, which config-drift tooling such as AIDE or Tripwire will notice. Nothing has been released yet, so no published behaviour changes.
+- On any host with an `Include` line (OpenSSH 8.2+, so every currently supported distribution) the role writes its settings to drop-ins under `/etc/ssh/sshd_config.d/` and no longer edits `/etc/ssh/sshd_config` at all, so rolling back is deleting a file rather than restoring someone else's config. Two files are used - one per stage - so a verify-stage rollback cannot delete install-stage settings an earlier run established. Older hosts keep the marked-block behaviour, backed up first. This does add files to `/etc/ssh/sshd_config.d/`, which config-drift tooling such as AIDE or Tripwire will notice.
 - The role no longer sets `AuthorizedKeysFile`. Forcing it would have overridden a central key store at drop-in precedence, stripping key access from every other user on the host while the rotated user kept working.
 - QUICKSTART and README rewritten around the vars file, with the repeated four-flag command replaced by a single example, plus a Limitations section and the new failure messages.
 - Post-quantum documentation moved out of README into [PQC.md](PQC.md), leaving a short pointer behind.
@@ -78,28 +101,3 @@
 ### Removed
 
 - Root-level test keypairs and `test_vars.yml` - local scratch files nothing depended on.
-
-## [Initial]
-
-### Added
-
-- Two-phase key rotation via a proper role: install the new key, verify it works, then remove the old key and disable legacy auth.
-- Cross-OS support for Debian/Ubuntu and RHEL/CentOS, zero-downtime (reload not restart).
-- Pre-flight validation of key paths, new key type/size, and key pair match, before touching any host.
-- `ssh_key_rotation_pqc_key_types` allowlist slot, reserved for future PQC key types.
-- Install stage now hard-fails if `sshd -T` won't actually accept the new key's algorithm.
-- `Match` block detection in `sshd_config`.
-- Automatic backup of `authorized_keys` and `sshd_config` before every edit.
-- Opt-in PQC/hybrid algorithm negotiation (off by default), plus RHEL/Fedora crypto-policy management. See README "PQC Algorithm Negotiation".
-- Crypto-policy support for RHEL/Fedora's `BASE:MODULE` syntax (e.g. `FIPS:PQ`), with a check that the module exists first.
-- Automatic rollback in the verify stage if old-key removal or auth cleanup fails.
-- Stricter old-key validation (files exist, key parses); warns if old and new keys are identical.
-- New-key acceptance check used a substring match against `sshd -T` output, which could false-positive on unrelated lines - the old key got removed even though the new algorithm wasn't actually accepted. Now parses `PubkeyAcceptedAlgorithms` directly.
-- New-key auth check could reuse a stale multiplexed SSH connection from the old key, making the check meaningless. Now forces `meta: reset_connection` first.
-- Same substring bug in the PQC "missing algorithm" check - fixed the same way.
-- `.gitignore` excludes generated private keys.
-- Rotation logic moved into a proper role (`roles/ssh_key_rotation/`) instead of three standalone playbooks.
-- All role variables now use an `ssh_key_rotation_` prefix (e.g. `manage_crypto_policy` → `ssh_key_rotation_manage_crypto_policy`).
-- Added `ansible.cfg` so the role is found locally without installing as a collection.
-- Deduplicated RHEL/Fedora crypto-policy logic and the Debian/RHEL sshd service lookup.
-- Redrew the README's PQC diagram to match actual stage names and show the rollback gate.
