@@ -11,201 +11,387 @@
   ansible.builtin.set_fact:
     ssh_key_rotation_new_key_type: "{{ ssh_key_rotation_new_key_info.stdout | regex_search('\\(([^)]+)\\)\\s*$') | regex_replace('[()]', '') }}"
 
+- name: Install | Resolve the target user's primary group
+  ansible.builtin.include_tasks: resolve_target_identity.yml
+
+# Decides, once, how this host will be configured. Drop-ins are used wherever sshd supports them,
+# so that undoing this run means deleting a file rather than restoring the administrator's own
+# sshd_config from a backup. Only hosts predating OpenSSH 8.2's Include support fall back to
+# editing the main file.
+- name: Install | Decide how this host's sshd will be configured
+  ansible.builtin.include_tasks: resolve_sshd_strategy.yml
+
 - name: Install | Check whether authorized_keys already exists
   ansible.builtin.stat:
     path: "~{{ ssh_key_rotation_target_user }}/.ssh/authorized_keys"
   register: ssh_key_rotation_authorized_keys_stat
 
+# owner/group are explicit, not left to `mode: preserve`: preserve copies the MODE only, never
+# the ownership. These plays normally run with become, so the copy executes as root and the new
+# file would otherwise be root-owned. sshd's StrictModes (on by default) ignores any
+# authorized_keys not owned by the target user, which silently breaks key auth for that user.
 - name: Install | Back up authorized_keys before modifying it
   when: ssh_key_rotation_authorized_keys_stat.stat.exists
   ansible.builtin.copy:
     src: "~{{ ssh_key_rotation_target_user }}/.ssh/authorized_keys"
-    dest: "~{{ ssh_key_rotation_target_user }}/.ssh/authorized_keys.bak-{{ ansible_date_time.iso8601_basic_short }}"
+    dest: "~{{ ssh_key_rotation_target_user }}/.ssh/authorized_keys.bak-{{ ansible_facts.date_time.iso8601_basic_short }}"
     remote_src: true
     mode: preserve
+    owner: "{{ ssh_key_rotation_target_user }}"
+    group: "{{ ssh_key_rotation_target_group }}"
+  register: ssh_key_rotation_install_ak_backup
 
-- name: Install | Install the new (PwC) public key in authorized_keys
-  ansible.posix.authorized_key:
-    user: "{{ ssh_key_rotation_target_user }}"
-    key: "{{ lookup('file', new_public_key_file) }}"
-    state: present
-    exclusive: false          # keep the old key for now - we still need it
-
-- name: Install | Ensure public key authentication is enabled
-  ansible.builtin.lineinfile:
-    path: /etc/ssh/sshd_config
-    regexp: '^#?\s*PubkeyAuthentication'
-    line: 'PubkeyAuthentication yes'
-    validate: 'sshd -t -f %s'
-    backup: true
-  become: true
-  notify: Reload sshd
-
-- name: Install | Ensure AuthorizedKeysFile points at the default location
-  ansible.builtin.lineinfile:
-    path: /etc/ssh/sshd_config
-    regexp: '^#?\s*AuthorizedKeysFile'
-    line: 'AuthorizedKeysFile .ssh/authorized_keys'
-    validate: 'sshd -t -f %s'
-    backup: true
-  become: true
-  notify: Reload sshd
-
-# Opt-in, empty by default; the + prefix appends to OpenSSH's compiled-in defaults so non-PQC clients can still fall back.
-- name: Install | Enable PQC/hybrid key exchange algorithms in sshd_config
-  when: ssh_key_rotation_pqc_kex_algorithms | length > 0
-  ansible.builtin.lineinfile:
-    path: /etc/ssh/sshd_config
-    regexp: '^#?\s*KexAlgorithms'
-    line: 'KexAlgorithms +{{ ssh_key_rotation_pqc_kex_algorithms | join(",") }}'
-    validate: 'sshd -t -f %s'
-    backup: true
-  become: true
-  notify: Reload sshd
-
-- name: Install | Enable PQC/hybrid public key algorithms in sshd_config
-  when: ssh_key_rotation_pqc_pubkey_algorithms | length > 0
-  ansible.builtin.lineinfile:
-    path: /etc/ssh/sshd_config
-    regexp: '^#?\s*PubkeyAcceptedAlgorithms'
-    line: 'PubkeyAcceptedAlgorithms +{{ ssh_key_rotation_pqc_pubkey_algorithms | join(",") }}'
-    validate: 'sshd -t -f %s'
-    backup: true
-  become: true
-  notify: Reload sshd
-
-# Reuses pqc_pubkey_algorithms for host keys too, since the same signature algorithms usually apply to both user and host keys.
-- name: Install | Enable PQC/hybrid host key algorithms in sshd_config
-  when: ssh_key_rotation_pqc_pubkey_algorithms | length > 0
-  ansible.builtin.lineinfile:
-    path: /etc/ssh/sshd_config
-    regexp: '^#?\s*HostKeyAlgorithms'
-    line: 'HostKeyAlgorithms +{{ ssh_key_rotation_pqc_pubkey_algorithms | join(",") }}'
-    validate: 'sshd -t -f %s'
-    backup: true
-  become: true
-  notify: Reload sshd
-
-- name: Install | Enable PQC/hybrid CA signature algorithms in sshd_config
-  when: ssh_key_rotation_pqc_ca_signature_algorithms | length > 0
-  ansible.builtin.lineinfile:
-    path: /etc/ssh/sshd_config
-    regexp: '^#?\s*CASignatureAlgorithms'
-    line: 'CASignatureAlgorithms +{{ ssh_key_rotation_pqc_ca_signature_algorithms | join(",") }}'
-    validate: 'sshd -t -f %s'
-    backup: true
-  become: true
-  notify: Reload sshd
-
-# Same opt-in crypto-policy handling as the validate stage's control-node block, detected via the tool rather than ansible_os_family.
-# Shared with validate.yml's control-node equivalent; see tasks/manage_crypto_policy.yml.
-- name: Install | Manage this host's system-wide crypto policy
-  ansible.builtin.include_tasks: manage_crypto_policy.yml
+# Recorded on the host itself, not just as a registered variable. The verify stage runs in a
+# separate play and may even be run standalone, and an undefined variable inside a rescue: aborts
+# the rescue entirely - leaving a half-changed host with no rollback at all, which is worse than
+# having none. See state_write.yml.
+- name: Install | Record the pre-install state on the host
+  ansible.builtin.include_tasks: state_write.yml
   vars:
-    ssh_key_rotation_crypto_policy_context: "this host"
-    ssh_key_rotation_crypto_policy_no_tool_followup: "Falling back to the direct sshd_config algorithm edits above only."
+    ssh_key_rotation_state:
+      run_id: "{{ ansible_facts.date_time.iso8601_basic_short }}"
+      stage: install-started
+      target_user: "{{ ssh_key_rotation_target_user }}"
+      target_group: "{{ ssh_key_rotation_target_group }}"
+      authorized_keys:
+        backup: "{{ ssh_key_rotation_install_ak_backup.dest | default(none) }}"
+        existed_before: "{{ ssh_key_rotation_authorized_keys_stat.stat.exists }}"
+      uses_dropin: "{{ ssh_key_rotation_use_dropin }}"
 
-# update-crypto-policies only validates its own syntax, not the merged sshd_config, so re-validate here before the reload handler fires.
-- name: Install | Validate sshd_config after crypto-policy check/apply
-  when:
-    - ssh_key_rotation_manage_crypto_policy | bool
-    - ssh_key_rotation_crypto_policies_tool.rc == 0
-  ansible.builtin.command: sshd -t
-  become: true
-  changed_when: false
-  register: ssh_key_rotation_sshd_validate_after_crypto_policy
-  failed_when: ssh_key_rotation_sshd_validate_after_crypto_policy.rc != 0
+# Everything below CHANGES the host: it adds the new key to authorized_keys, writes this role's
+# sshd configuration, and may switch the system-wide crypto policy. Previously none of it was
+# undone when a later task failed - so when the crypto-policy guard further down refused a key type
+# the host was left carrying the new key and this role's config, while the run reported that
+# "nothing has been broken". Access was indeed intact, but the host was not as we found it.
+#
+# The rescue below returns it to its pre-install state. It is safe to restore authorized_keys here
+# in a way the verify stage cannot assume: this play is CONNECTED over the old key, so the
+# credential being restored is demonstrably working. It is still probed rather than assumed.
+- name: Install | Apply changes, with automatic rollback if any of them fails
+  block:
+    - name: Install | Install the new (PwC) public key in authorized_keys
+      ansible.posix.authorized_key:
+        user: "{{ ssh_key_rotation_target_user }}"
+        key: "{{ lookup('file', new_public_key_file) }}"
+        state: present
+        exclusive: false          # keep the old key for now - we still need it
 
-# A drop-in (e.g. /etc/ssh/sshd_config.d/50-cloud-init.conf) can override the main file - if your hosts use drop-ins, write these settings there instead.
-- name: Install | Detect any sshd_config drop-in files that could override settings
-  ansible.builtin.find:
-    paths: /etc/ssh/sshd_config.d
-    patterns: '*.conf'
-  become: true
-  register: ssh_key_rotation_sshd_dropins
-  failed_when: false
+    # Settings this stage needs, rendered once and written either to a drop-in or - on pre-8.2 hosts -
+    # to a marked block in sshd_config.
+    #
+    # AuthorizedKeysFile is deliberately NOT set. This role used to force it to `.ssh/authorized_keys`,
+    # which is harmless while it sits in the main file (an administrator's drop-in outranks it), but at
+    # the 01- prefix it would outrank a central key store such as
+    # `AuthorizedKeysFile /etc/ssh/authorized_keys/%u` and strip key access from every OTHER user on the
+    # host - while the rotated user, whose key was just written to ~/.ssh, kept working. The run would
+    # report success having locked out the rest of the estate. The value is read from `sshd -T` and
+    # asserted further down instead, so a host that keeps keys elsewhere fails loudly rather than being
+    # silently reconfigured.
+    #
+    # The PQC directives keep the `+` prefix, which appends to OpenSSH's compiled-in defaults so
+    # clients that do not speak PQC can still fall back to a classical algorithm.
+    - name: Install | Render this stage's sshd settings
+      ansible.builtin.set_fact:
+        ssh_key_rotation_install_settings: |
+          # Managed by krameff.ssh_key_rotation (install stage). Safe to remove; this role rewrites it.
+          PubkeyAuthentication yes
+          {% if ssh_key_rotation_pqc_kex_algorithms | length > 0 %}
+          KexAlgorithms +{{ ssh_key_rotation_pqc_kex_algorithms | join(",") }}
+          {% endif %}
+          {% if ssh_key_rotation_pqc_pubkey_algorithms | length > 0 %}
+          PubkeyAcceptedAlgorithms +{{ ssh_key_rotation_pqc_pubkey_algorithms | join(",") }}
+          HostKeyAlgorithms +{{ ssh_key_rotation_pqc_pubkey_algorithms | join(",") }}
+          {% endif %}
+          {% if ssh_key_rotation_pqc_ca_signature_algorithms | length > 0 %}
+          CASignatureAlgorithms +{{ ssh_key_rotation_pqc_ca_signature_algorithms | join(",") }}
+          {% endif %}
 
-- name: Install | Warn if drop-in config files are present
-  when: ssh_key_rotation_sshd_dropins.files | default([]) | length > 0
-  ansible.builtin.debug:
-    msg: >-
-      Drop-in sshd config files found: {{ ssh_key_rotation_sshd_dropins.files | map(attribute='path') | list }}.
-      Verify none of them re-enable the settings this playbook is changing.
-      {{ "Note: 50-redhat.conf is the crypto-policy backend include - manage its " ~
-         "algorithm settings via update-crypto-policies/manage_crypto_policy, not by " ~
-         "hand-editing it directly." if ssh_key_rotation_sshd_dropins.files | map(attribute='path')
-            | select('search', '50-redhat.conf') | list | length > 0 else "" }}
+    - name: Install | Write this stage's settings to a drop-in
+      when: ssh_key_rotation_use_dropin | bool
+      ansible.builtin.include_tasks: sshd_dropin_write.yml
+      vars:
+        ssh_key_rotation_dropin_name: ssh-key-rotation.conf
+        ssh_key_rotation_dropin_key: install
+        ssh_key_rotation_dropin_content: "{{ ssh_key_rotation_install_settings }}"
 
-# lineinfile only edits the global section; a Match block (e.g. Match User ...) can override these settings and isn't inspected here.
-- name: Install | Detect Match blocks in sshd_config that could override global settings
-  ansible.builtin.command: "grep -n '^[[:space:]]*Match' /etc/ssh/sshd_config"
-  become: true
-  register: ssh_key_rotation_sshd_match_blocks
-  changed_when: false
-  failed_when: false
+    # Pre-8.2 fallback only. Anchored to the global section because a lineinfile regexp matching a
+    # keyword anywhere in the file replaces the LAST occurrence, and Match blocks sit at the END of
+    # sshd_config - so the previous code silently rewrote per-user policy instead of the global setting.
+    - name: Install | Fall back to a marked block in sshd_config on hosts without Include
+      when: not (ssh_key_rotation_use_dropin | bool)
+      ansible.builtin.blockinfile:
+        path: /etc/ssh/sshd_config
+        marker: "# {mark} krameff.ssh_key_rotation install"
+        # default(omit, true) turns an empty anchor into "parameter not supplied", so blockinfile
+        # falls back to its EOF default. At most one of the two is ever non-empty.
+        insertafter: "{{ ssh_key_rotation_block_after | default(omit, true) }}"
+        insertbefore: "{{ ssh_key_rotation_block_before | default(omit, true) }}"
+        block: "{{ ssh_key_rotation_install_settings }}"
+        validate: 'sshd -t -f %s'
+        backup: true
+      become: true
+      notify: Reload sshd
 
-- name: Install | Warn if Match blocks are present
-  when: ssh_key_rotation_sshd_match_blocks.stdout_lines | default([]) | length > 0
-  ansible.builtin.debug:
-    msg: >-
-      sshd_config contains Match block(s): {{ ssh_key_rotation_sshd_match_blocks.stdout_lines }}.
-      This playbook only edits the global section - settings inside a Match
-      block are NOT modified and could silently override what this playbook sets.
+    # Same opt-in crypto-policy handling as the validate stage's control-node block, detected via the tool rather than ansible_os_family.
+    # Shared with validate.yml's control-node equivalent; see tasks/manage_crypto_policy.yml.
+    - name: Install | Manage this host's system-wide crypto policy
+      ansible.builtin.include_tasks: manage_crypto_policy.yml
+      vars:
+        ssh_key_rotation_crypto_policy_context: "this host"
+        ssh_key_rotation_crypto_policy_no_tool_followup: "Falling back to the direct sshd_config algorithm edits above only."
 
-- name: Install | Apply sshd changes now so the new key is usable in the verify stage
-  ansible.builtin.meta: flush_handlers
+    # update-crypto-policies only validates its own syntax, not the merged sshd_config, so re-validate here before the reload handler fires.
+    - name: Install | Validate sshd_config after crypto-policy check/apply
+      when:
+        - ssh_key_rotation_manage_crypto_policy | bool
+        - ssh_key_rotation_crypto_policies_tool.rc == 0
+      ansible.builtin.command: sshd -t
+      become: true
+      changed_when: false
+      register: ssh_key_rotation_sshd_validate_after_crypto_policy
+      failed_when: ssh_key_rotation_sshd_validate_after_crypto_policy.rc != 0
 
-- name: Install | Check the effective sshd configuration for the new key's algorithm
-  ansible.builtin.command: sshd -T
-  become: true
-  changed_when: false
-  failed_when: false
-  register: ssh_key_rotation_sshd_effective_config
+    # A drop-in (e.g. /etc/ssh/sshd_config.d/50-cloud-init.conf) can override the main file - if your hosts use drop-ins, write these settings there instead.
+    - name: Install | Detect any sshd_config drop-in files that could override settings
+      ansible.builtin.find:
+        paths: /etc/ssh/sshd_config.d
+        patterns: '*.conf'
+      become: true
+      register: ssh_key_rotation_sshd_dropins
+      failed_when: false
 
-# Extracted as real comma-split lists, not a whole-blob substring search (which false-matched "ed25519" against the unrelated hostkey path line).
-- name: Install | Extract the effective PubkeyAcceptedAlgorithms as a list
-  when: ssh_key_rotation_sshd_effective_config.rc == 0
-  ansible.builtin.set_fact:
-    ssh_key_rotation_effective_pubkey_algorithms: >-
-      {{ (ssh_key_rotation_sshd_effective_config.stdout
-          | regex_search('(?im)^pubkeyacceptedalgorithms\s+(\S+)$', '\1')
-          | default([], true) | first | default('')).split(',') }}
-    ssh_key_rotation_effective_kex_algorithms: >-
-      {{ (ssh_key_rotation_sshd_effective_config.stdout
-          | regex_search('(?im)^kexalgorithms\s+(\S+)$', '\1')
-          | default([], true) | first | default('')).split(',') }}
+    - name: Install | Warn if drop-in config files are present
+      when: ssh_key_rotation_sshd_dropins.files | default([]) | length > 0
+      ansible.builtin.debug:
+        msg: >-
+          Drop-in sshd config files found: {{ ssh_key_rotation_sshd_dropins.files | map(attribute='path') | list }}.
+          Verify none of them re-enable the settings this playbook is changing.
+          {{ "Note: 50-redhat.conf is the crypto-policy backend include - manage its " ~
+             "algorithm settings via update-crypto-policies/manage_crypto_policy, not by " ~
+             "hand-editing it directly." if ssh_key_rotation_sshd_dropins.files | map(attribute='path')
+                | select('search', '50-redhat.conf') | list | length > 0 else "" }}
 
-# Hard failure, not a warning: stops before the verify stage could remove the old key if the target's crypto-policy would reject the new key entirely.
-- name: Install | Fail if the target's sshd will not accept the new key's signature algorithm
-  when: ssh_key_rotation_sshd_effective_config.rc == 0
-  ansible.builtin.assert:
-    that: >-
-      (ssh_key_rotation_key_type_signature_algorithms[ssh_key_rotation_new_key_type] | default([ssh_key_rotation_new_key_type | lower]))
-      | intersect(ssh_key_rotation_effective_pubkey_algorithms) | length > 0
-    fail_msg: >-
-      sshd -T on this host reports PubkeyAcceptedAlgorithms={{ ssh_key_rotation_effective_pubkey_algorithms | join(',') }},
-      which does not include any signature algorithm for a {{ ssh_key_rotation_new_key_type }} key
-      ({{ ssh_key_rotation_key_type_signature_algorithms[ssh_key_rotation_new_key_type] | default([ssh_key_rotation_new_key_type]) | join(',') }}).
-      This host's crypto-policy would reject the new key entirely. Generate a key type this host's
-      PubkeyAcceptedAlgorithms accepts (see README.md's Key Validation section), or adjust
-      pqc_pubkey_algorithms/manage_crypto_policy, before continuing. Aborting now, before
-      the verify stage would remove the old key - nothing has been broken.
-    success_msg: "Target sshd will accept the new {{ ssh_key_rotation_new_key_type }} key's signature algorithm."
+    # lineinfile only edits the global section; a Match block (e.g. Match User ...) can override these settings and isn't inspected here.
+    - name: Install | Detect Match blocks in sshd_config that could override global settings
+      ansible.builtin.command: "grep -n '^[[:space:]]*Match' /etc/ssh/sshd_config"
+      become: true
+      register: ssh_key_rotation_sshd_match_blocks
+      changed_when: false
+      failed_when: false
 
-- name: Install | Determine which requested PQC algorithms are missing from the effective sshd config
-  when:
-    - ssh_key_rotation_sshd_effective_config.rc == 0
-    - (ssh_key_rotation_pqc_kex_algorithms + ssh_key_rotation_pqc_pubkey_algorithms) | length > 0
-  ansible.builtin.set_fact:
-    ssh_key_rotation_missing_pqc_algorithms: >-
-      {{ (ssh_key_rotation_pqc_kex_algorithms | difference(ssh_key_rotation_effective_kex_algorithms))
-         + (ssh_key_rotation_pqc_pubkey_algorithms | difference(ssh_key_rotation_effective_pubkey_algorithms)) }}
+    - name: Install | Warn if Match blocks are present
+      when: ssh_key_rotation_sshd_match_blocks.stdout_lines | default([]) | length > 0
+      ansible.builtin.debug:
+        msg: >-
+          sshd_config contains Match block(s): {{ ssh_key_rotation_sshd_match_blocks.stdout_lines }}.
+          This playbook only edits the global section - settings inside a Match
+          block are NOT modified and could silently override what this playbook sets.
 
-- name: Install | Warn if sshd's effective config doesn't appear to include the requested PQC algorithms
-  when:
-    - ssh_key_rotation_missing_pqc_algorithms is defined
-    - ssh_key_rotation_missing_pqc_algorithms | length > 0
-  ansible.builtin.debug:
-    msg: >-
-      sshd -T on this host does not list: {{ ssh_key_rotation_missing_pqc_algorithms }}.
-      The verify stage may fail to negotiate these; review sshd_config/crypto-policy before proceeding.
+    - name: Install | Apply sshd changes now so the new key is usable in the verify stage
+      ansible.builtin.meta: flush_handlers
+
+    - name: Install | Check the effective sshd configuration for the new key's algorithm
+      ansible.builtin.command: sshd -T
+      become: true
+      changed_when: false
+      failed_when: false
+      register: ssh_key_rotation_sshd_effective_config
+
+    # Extracted as real comma-split lists, not a whole-blob substring search (which false-matched "ed25519" against the unrelated hostkey path line).
+    - name: Install | Extract the effective PubkeyAcceptedAlgorithms as a list
+      when: ssh_key_rotation_sshd_effective_config.rc == 0
+      ansible.builtin.set_fact:
+        ssh_key_rotation_effective_pubkey_algorithms: >-
+          {{ (ssh_key_rotation_sshd_effective_config.stdout
+              | regex_search('(?im)^pubkeyacceptedalgorithms\s+(\S+)$', '\1')
+              | default([], true) | first | default('')).split(',') }}
+        ssh_key_rotation_effective_kex_algorithms: >-
+          {{ (ssh_key_rotation_sshd_effective_config.stdout
+              | regex_search('(?im)^kexalgorithms\s+(\S+)$', '\1')
+              | default([], true) | first | default('')).split(',') }}
+
+    # Hard failure, not a warning: stops before the verify stage could remove the old key if the target's crypto-policy would reject the new key entirely.
+    # Read, never written. This role installs the key into ~/.ssh/authorized_keys via
+    # ansible.posix.authorized_key, so if the host keeps keys somewhere else - a central store such as
+    # `AuthorizedKeysFile /etc/ssh/authorized_keys/%u` is common on hardened estates - the key lands
+    # somewhere sshd will not look and the rotation is silently ineffective. Forcing the value instead
+    # would be worse: at drop-in precedence it would redirect EVERY user on the host to ~/.ssh, locking
+    # out everyone whose keys live in the central store while the rotated user kept working.
+    - name: Install | Extract the effective AuthorizedKeysFile
+      when: ssh_key_rotation_sshd_effective_config.rc == 0
+      ansible.builtin.set_fact:
+        ssh_key_rotation_effective_authorized_keys_file: >-
+          {{ (ssh_key_rotation_sshd_effective_config.stdout
+              | regex_search('(?im)^authorizedkeysfile\s+(.+)$', '\1')
+              | default([], true) | first | default('')) }}
+
+    - name: Install | Fail if this host does not read keys from the user's own ~/.ssh/authorized_keys
+      when:
+        - ssh_key_rotation_sshd_effective_config.rc == 0
+        - ssh_key_rotation_effective_authorized_keys_file | length > 0
+      ansible.builtin.assert:
+        that: >-
+          ssh_key_rotation_effective_authorized_keys_file.split()
+          | select('search', '(^|/)\.ssh/authorized_keys') | list | length > 0
+        fail_msg: >-
+          sshd on this host reports AuthorizedKeysFile={{ ssh_key_rotation_effective_authorized_keys_file }},
+          which does not include the user's own ~/.ssh/authorized_keys. This role installs the new key
+          there, so sshd would never read it and the rotation would appear to succeed while the new key
+          did nothing. Point AuthorizedKeysFile at .ssh/authorized_keys for this user, or install the key
+          into the location above by other means, before rotating. Aborting before the verify stage could
+          remove the old key - nothing has been broken.
+        success_msg: >-
+          sshd reads keys from the user's own ~/.ssh/authorized_keys
+          ({{ ssh_key_rotation_effective_authorized_keys_file }}), which is where this role installs them.
+
+    - name: Install | Fail if the target's sshd will not accept the new key's signature algorithm
+      when: ssh_key_rotation_sshd_effective_config.rc == 0
+      ansible.builtin.assert:
+        that: >-
+          (ssh_key_rotation_key_type_signature_algorithms[ssh_key_rotation_new_key_type] | default([ssh_key_rotation_new_key_type | lower]))
+          | intersect(ssh_key_rotation_effective_pubkey_algorithms) | length > 0
+        fail_msg: >-
+          sshd -T on this host reports PubkeyAcceptedAlgorithms={{ ssh_key_rotation_effective_pubkey_algorithms | join(',') }},
+          which does not include any signature algorithm for a {{ ssh_key_rotation_new_key_type }} key
+          ({{ ssh_key_rotation_key_type_signature_algorithms[ssh_key_rotation_new_key_type] | default([ssh_key_rotation_new_key_type]) | join(',') }}).
+          This host's crypto-policy would reject the new key entirely. Generate a key type this host's
+          PubkeyAcceptedAlgorithms accepts (see README.md's Key Validation section), or adjust
+          pqc_pubkey_algorithms/manage_crypto_policy, before continuing. Aborting now, before
+          the verify stage would remove the old key - nothing has been broken.
+        success_msg: "Target sshd will accept the new {{ ssh_key_rotation_new_key_type }} key's signature algorithm."
+
+    - name: Install | Determine which requested PQC algorithms are missing from the effective sshd config
+      when:
+        - ssh_key_rotation_sshd_effective_config.rc == 0
+        - (ssh_key_rotation_pqc_kex_algorithms + ssh_key_rotation_pqc_pubkey_algorithms) | length > 0
+      ansible.builtin.set_fact:
+        ssh_key_rotation_missing_pqc_algorithms: >-
+          {{ (ssh_key_rotation_pqc_kex_algorithms | difference(ssh_key_rotation_effective_kex_algorithms))
+             + (ssh_key_rotation_pqc_pubkey_algorithms | difference(ssh_key_rotation_effective_pubkey_algorithms)) }}
+
+    - name: Install | Warn if sshd's effective config doesn't appear to include the requested PQC algorithms
+      when:
+        - ssh_key_rotation_missing_pqc_algorithms is defined
+        - ssh_key_rotation_missing_pqc_algorithms | length > 0
+      ansible.builtin.debug:
+        msg: >-
+          sshd -T on this host does not list: {{ ssh_key_rotation_missing_pqc_algorithms }}.
+          The verify stage may fail to negotiate these; review sshd_config/crypto-policy before proceeding.
+
+  rescue:
+    - name: Install rollback | Re-read the recorded state so it includes this stage's own changes
+      ansible.builtin.include_tasks: state_read.yml
+
+    # Configuration first: removing this role's own files cannot cost anyone access.
+    - name: Install rollback | Remove the install drop-in if this run created it
+      when:
+        - (ssh_key_rotation_recorded.dropins | default({})).install is defined
+        - ssh_key_rotation_recorded.dropins.install.created_by_role | default(false) | bool
+      ansible.builtin.file:
+        path: "{{ ssh_key_rotation_recorded.dropins.install.path }}"
+        state: absent
+      become: true
+      register: ssh_key_rotation_install_rb_dropin
+
+    - name: Install rollback | Restore an install drop-in that existed before this run
+      when:
+        - (ssh_key_rotation_recorded.dropins | default({})).install is defined
+        - ssh_key_rotation_recorded.dropins.install.backup | default(none) is not none
+      ansible.builtin.copy:
+        src: "{{ ssh_key_rotation_recorded.dropins.install.backup }}"
+        dest: "{{ ssh_key_rotation_recorded.dropins.install.path }}"
+        remote_src: true
+        mode: preserve
+      become: true
+      register: ssh_key_rotation_install_rb_dropin_restored
+
+    # Pre-8.2 hosts only, where the marked block had to go into the main file.
+    - name: Install rollback | Remove the marked block from sshd_config on hosts without drop-ins
+      when: not (ssh_key_rotation_use_dropin | default(true) | bool)
+      ansible.builtin.blockinfile:
+        path: /etc/ssh/sshd_config
+        marker: "# {mark} krameff.ssh_key_rotation install"
+        state: absent
+        validate: 'sshd -t -f %s'
+      become: true
+      register: ssh_key_rotation_install_rb_block
+
+    # `.dest is defined`, not `is succeeded`: a SKIPPED result also satisfies `is succeeded`, and
+    # referencing .dest on one raises inside the rescue - which aborts the rescue and cancels the
+    # rollback entirely.
+    - name: Install rollback | Prove the old key still works before touching authorized_keys
+      when:
+        - (ssh_key_rotation_recorded.authorized_keys | default({})).backup | default(none) is not none
+        - old_private_key is defined
+      ansible.builtin.include_tasks: probe_key.yml
+      vars:
+        ssh_key_rotation_probe_key: "{{ old_private_key }}"
+        ssh_key_rotation_probe_label: old key
+        ssh_key_rotation_probe_required: false
+
+    - name: Install rollback | Restore the pre-install authorized_keys
+      when:
+        - (ssh_key_rotation_recorded.authorized_keys | default({})).backup | default(none) is not none
+        - ssh_key_rotation_probe_result is defined and ssh_key_rotation_probe_result.rc == 0
+      ansible.builtin.copy:
+        src: "{{ ssh_key_rotation_recorded.authorized_keys.backup }}"
+        dest: "~{{ ssh_key_rotation_target_user }}/.ssh/authorized_keys"
+        remote_src: true
+        mode: preserve
+        owner: "{{ ssh_key_rotation_target_user }}"
+        group: "{{ ssh_key_rotation_recorded.target_group | default(ssh_key_rotation_target_group) }}"
+      become: true
+      register: ssh_key_rotation_install_rb_ak
+
+    # Only if a configuration file actually changed back. authorized_keys needs no reload at all,
+    # since sshd reads it per new connection.
+    - name: Install rollback | Reload sshd only if its configuration was changed back
+      when: >-
+        (ssh_key_rotation_install_rb_dropin is defined and ssh_key_rotation_install_rb_dropin is changed)
+        or (ssh_key_rotation_install_rb_dropin_restored is defined and ssh_key_rotation_install_rb_dropin_restored is changed)
+        or (ssh_key_rotation_install_rb_block is defined and ssh_key_rotation_install_rb_block is changed)
+      ansible.builtin.service:
+        name: "{{ ssh_key_rotation_sshd_service }}"
+        state: reloaded
+      become: true
+      register: ssh_key_rotation_install_rb_reload
+      ignore_errors: true
+
+    - name: Install rollback | Record the rollback in the host's rotation state
+      ansible.builtin.include_tasks: state_write.yml
+      vars:
+        ssh_key_rotation_state:
+          stage: install-rolled-back
+
+    # Guarded: an undefined variable referenced inside a rescue aborts the rescue and cancels the
+    # rollback, so this never assumes old_private_key was supplied.
+    - name: Install rollback | Prove the old key still authenticates after the rollback
+      when: old_private_key is defined
+      ansible.builtin.include_tasks: probe_key.yml
+      vars:
+        ssh_key_rotation_probe_key: "{{ old_private_key }}"
+        ssh_key_rotation_probe_label: old key
+        ssh_key_rotation_probe_required: false
+
+    - name: Install rollback | Fail with details of what was automatically undone
+      ansible.builtin.fail:
+        msg: >-
+          Install stage failed and was automatically rolled back.
+          Original error: {{ ansible_failed_result.msg | default(ansible_failed_result) }}.
+          {{ ('CRITICAL: the old key could NOT authenticate on a fresh connection after the rollback'
+              ~ ' (ssh exited ' ~ (ssh_key_rotation_probe_result.rc | default('unknown') | string)
+              ~ ': ' ~ (ssh_key_rotation_probe_result.stderr | default('') | trim)
+              ~ '). Do not close existing sessions; recover via console if needed.')
+             if (ssh_key_rotation_probe_result is not defined or ssh_key_rotation_probe_result.rc != 0)
+             else 'The old key was re-proven on a fresh, unmultiplexed connection after the rollback.' }}
+          {{ ("This role's sshd configuration was removed.")
+             if (ssh_key_rotation_use_dropin | default(true) | bool)
+             else ("This role's marked block was removed from sshd_config.") }}
+          {{ 'authorized_keys was restored to its pre-install contents, so the new key is no longer installed.'
+             if (ssh_key_rotation_install_rb_ak is defined and ssh_key_rotation_install_rb_ak is changed)
+             else 'authorized_keys was left as-is: no pre-install backup was recorded, or the old key could not be proven to work.' }}
+          {{ ('WARNING: sshd could not be reloaded during the rollback ('
+              ~ (ssh_key_rotation_install_rb_reload.msg | default('unknown error'))
+              ~ ') - the restored configuration is on disk but is NOT yet active.')
+             if (ssh_key_rotation_install_rb_reload is defined and ssh_key_rotation_install_rb_reload is failed)
+             else '' }}

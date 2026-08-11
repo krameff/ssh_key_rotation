@@ -2,22 +2,36 @@
 
 Instructions for extending and testing the SSH Key Rotation collection.
 
-## Project Structure
+For the contribution workflow, the checks a change has to pass, and the pull request policy, see [CONTRIBUTING.md](CONTRIBUTING.md). This file covers the project layout, how to add code, and how releases are built.
+
+## Project structure
 
 ```
 krameff-ssh_key_rotation/
 ├── galaxy.yml              # Collection metadata
 ├── README.md               # Main documentation
 ├── QUICKSTART.md           # Quick start guide
+├── CONTRIBUTING.md         # How to contribute, and what a change has to pass
+├── SECURITY.md             # Private disclosure route, and what counts as a security issue here
 ├── CHANGELOG.md            # Version history
 ├── DEVELOPMENT.md          # This file
 ├── requirements.yml        # Ansible Galaxy dependencies
-├── inventory.example.ini    # Example inventory
+├── inventory.example.ini   # Example inventory
+├── ansible.cfg             # Sets roles_path so playbooks/rotate.yml finds roles/ without installing the collection
 ├── .ansible-lint           # ansible-lint configuration (production profile)
 ├── .github/
+│   ├── pull_request_template.md
+│   ├── ISSUE_TEMPLATE/     # Bug and feature forms; config.yml routes security reports privately
 │   └── workflows/
-│       └── ci.yml          # Lint + syntax-check on push/PR
-├── ansible.cfg             # Sets roles_path so playbooks/rotate.yml finds roles/ without installing the collection
+│       ├── ci.yml          # Lint + syntax-check on push/PR
+│       ├── molecule.yml    # Functional Molecule tests (all 3 scenarios) on push/PR, plus a weekly run
+│       └── release.yml     # Builds and publishes to Galaxy on a v* tag
+├── extensions/
+│   └── molecule/           # Molecule scenarios (the location current Molecule expects)
+│       ├── default/        # Full rotation over real SSH, twice, to also prove idempotency
+│       ├── nonroot/        # Same, rotating a non-root user, to catch file-ownership mistakes
+│       ├── resources/      # Shared prepare playbook and Dockerfile used by all scenarios
+│       └── rollback/       # Breaks a rotation mid-verify to prove the rescue block restores access
 ├── meta/
 │   └── runtime.yml         # Ansible version requirements
 ├── playbooks/
@@ -28,152 +42,174 @@ krameff-ssh_key_rotation/
 │       ├── handlers/main.yml  # Shared "Reload sshd" handler
 │       ├── meta/main.yml      # Role metadata (platforms, min Ansible version)
 │       └── tasks/
-│           ├── main.yml                  # Fails fast - this role has no default entry point, see below
+│           ├── main.yml                  # Fails fast; this role has no default entry point, see below
+│           ├── resolve_sshd_anchor.yml    # Works out where the managed sshd_config blocks belong
 │           ├── validate.yml              # Phase 0: local pre-flight validation
 │           ├── install.yml               # Phase 1: install the new key, prepare sshd (connect via OLD key)
 │           ├── verify.yml                # Phase 2: verify the new key, then remove the old key/legacy auth
-│           └── manage_crypto_policy.yml  # RHEL/Fedora crypto-policy logic, shared by validate.yml and install.yml via include_tasks
+│           └── manage_crypto_policy.yml  # RHEL/Fedora crypto-policy logic, shared by validate.yml and install.yml
 └── plugins/
     ├── modules/            # Custom modules (future)
     └── filters/            # Custom filters (future)
 ```
 
-## Setup for Development
+### Why there is no usable `tasks/main.yml`
 
-### Prerequisites
+Each stage of a rotation authenticates differently. Validate runs on the control node with no remote connection at all, install connects with the old key, and verify connects with the new one. There is no single set of connection variables that would work for all three, so the role deliberately has no default entry point and must be included with an explicit `tasks_from`. `tasks/main.yml` exists only to fail with a message saying so.
 
-```bash
-# Ansible 2.15+
-pip install 'ansible>=2.15'
+That is also why `playbooks/rotate.yml` is three separate plays rather than one.
 
-# ansible.posix collection
-ansible-galaxy collection install ansible.posix
-
-# Testing tools (optional but recommended)
-pip install ansible-lint pytest-ansible molecule
-```
-
-### Clone and Setup
+## Setting up
 
 ```bash
-git clone <repository-url>
-cd krameff-ssh_key_rotation
+git clone https://github.com/krameff/ssh_key_rotation
+cd ssh_key_rotation
 
-# Install dependencies
+python -m venv .venv && source .venv/bin/activate
+
+# Ansible, matching the minimum in meta/runtime.yml
+pip install "ansible>=2.18"
+
+# Testing tools
+pip install ansible-lint pre-commit "molecule>=25.0" "molecule-plugins[docker]"
+
+# Collection dependencies
 ansible-galaxy install -r requirements.yml
 
-# Verify collection structure
+# Install the git hooks
+pre-commit install
+
+# Sanity check the collection structure
 ansible-galaxy collection build .
 ```
 
-## Development Tasks
+`pre-commit install` writes to `.git/hooks/`, which is not tracked, so every clone needs it run once.
 
-### Adding a New Playbook
+## Adding code
 
-1. Create the playbook in `playbooks/`:
-   ```bash
-   touch playbooks/my_new_playbook.yml
-   ```
+### A new playbook
 
-2. Update `README.md` with usage instructions
+1. Create it in `playbooks/`.
+2. Document its usage in `README.md`.
+3. Test it: `ansible-playbook -i inventory.ini playbooks/my_new_playbook.yml`
 
-3. Test with:
-   ```bash
-   ansible-playbook -i inventory.ini playbooks/my_new_playbook.yml
-   ```
+### A custom module
 
-### Adding a Custom Module
+1. Create it in `plugins/modules/`.
+2. Document it in the module's `DOCUMENTATION` docstring.
+3. Test it: `ansible localhost -m my_module -a "param=value"`
 
-1. Create the module in `plugins/modules/`:
-   ```bash
-   touch plugins/modules/my_module.py
-   ```
+### A custom filter
 
-2. Add module documentation in the docstring
-
-3. Test with:
-   ```bash
-   ansible localhost -m my_module -a "param=value"
-   ```
-
-### Adding a Custom Filter
-
-1. Create the filter in `plugins/filters/my_filters.py`
-
-2. Implement the filter function
-
-3. Test with:
-   ```bash
-   ansible localhost -m debug -a "msg='{{ 'test' | my_filter }}'"
-   ```
+1. Create it in `plugins/filters/my_filters.py` and implement the filter function.
+2. Test it: `ansible localhost -m debug -a "msg='{{ 'test' | my_filter }}'"`
 
 ## Testing
 
-### Syntax Check
+### Lint and syntax
 
 ```bash
+# Every hook: secret and private key detection, whitespace, YAML lint, ansible-lint
+pre-commit run --all-files
+
+# Not covered by a hook
 ansible-playbook playbooks/rotate.yml --syntax-check
 ```
 
-### Dry Run
+`ansible-lint` runs on the `production` profile, configured in `.ansible-lint`. It lints the whole repository, because `playbooks/rotate.yml` is only the entry point and linting it alone would miss the role.
+
+Hooks run automatically on commit once `pre-commit install` has been run. To bypass them for a work-in-progress commit, `git commit --no-verify`, but do not push a branch that has not passed them.
+
+### Where each check runs
+
+| Check | Where |
+|-------|-------|
+| All hooks except `ansible-lint` | pre-commit.ci, on pull requests |
+| `ansible-lint`, syntax check | `.github/workflows/ci.yml` |
+| Molecule scenarios | `.github/workflows/molecule.yml` |
+
+`ansible-lint` is in the `ci.skip` list in `.pre-commit-config.yaml` because pre-commit.ci's runner cannot install `ansible.posix`, so the hook could not resolve the collection there. It runs in the CI workflow instead, which does an `ansible-galaxy install -r requirements.yml` first.
+
+`.pre-commit-config.yaml` also pins `default_language_version` to Python 3.12, because the ansible-lint hook's manifest asks for an interpreter newer than most machines have installed, and pre-commit fails to build the hook environment at all without the override.
+
+### Dry run
 
 ```bash
 ansible-playbook -i inventory.ini playbooks/rotate.yml --check
 ```
 
-### Lint with ansible-lint
+### Molecule
+
+Three scenarios live under `extensions/molecule/`. They run against live containers (Ubuntu 22.04, Rocky Linux 9, Rocky Linux 10) with sshd installed and running.
 
 ```bash
-# rotate.yml is just the entry point; lint the whole repo to cover the role too
-ansible-lint
+# Full rotation via playbooks/rotate.yml, run twice to also prove idempotency
+molecule test -s default
+
+# The same rotation, but against a non-root user whose primary group differs from its name
+molecule test -s nonroot
+
+# Runs the role's stages directly, breaking the second rotation mid-verify to prove the
+# block/rescue in roles/ssh_key_rotation/tasks/verify.yml actually restores access
+molecule test -s rollback
 ```
 
-### Integration Testing with Molecule (Future)
+All three generate their own ephemeral SSH keypairs and inventory into Molecule's per-run directory, so nothing needs to exist in the repository for them to run.
+
+`nonroot` and `rollback` rotate a non-root account on purpose. The role does its file work under
+`become`, so an `authorized_keys` it writes for a non-root user has to be chowned back explicitly;
+if it is not, sshd's `StrictModes` ignores the file and refuses every key. That failure is
+invisible when the target is `root`, because root-owned is then the correct result, so a root-only
+suite cannot catch it. `rollback` is the important one, since the bug's natural home is the
+`rescue` path.
+
+While iterating, avoid the full create-and-destroy cycle each time:
 
 ```bash
-# Create a scenario
-molecule init scenario -d <driver> -s <scenario_name>
-
-# Test the scenario
-molecule test
+molecule converge -s default   # run against live containers
+molecule verify -s default     # run just the assertions
+molecule destroy -s default    # clean up
 ```
 
-## Building and Publishing
+The scenarios track the `geerlingguy` CI images by `:latest`, so the base images move underneath the suite between commits. `molecule.yml` runs weekly for that reason, so drift surfaces as its own red build rather than as a mystery failure on an unrelated pull request.
 
-### Build a Distribution Tarball
+### Two ways a test here can silently never fail
+
+Both of these have happened in this repository and are worth checking for in any new assertion:
+
+- **The container connection ignores SSH keys.** A task run over Molecule's `docker` or `podman` connection proves the host is reachable, not that a key authenticates. To test authentication, drive a real `ssh` client.
+- **Key material is not a safe regex.** Base64 key data contains regex metacharacters, so a pattern built from a key can match when the key is still present. Match it literally.
+
+Before relying on a new assertion, break the thing it checks and confirm it goes red.
+
+### Manual testing
+
+Generate throwaway keys outside the repository and point the playbook at them:
 
 ```bash
-ansible-galaxy collection build .
-# Output: ./krameff-ssh_key_rotation-1.0.0.tar.gz
+ssh-keygen -t rsa -b 4096 -N "" -f /tmp/rotation-old
+ssh-keygen -t ed25519 -N "" -f /tmp/rotation-new
+
+ansible-playbook -i inventory.ini playbooks/rotate.yml \
+  -e old_private_key=/tmp/rotation-old \
+  -e old_public_key_file=/tmp/rotation-old.pub \
+  -e new_private_key=/tmp/rotation-new \
+  -e new_public_key_file=/tmp/rotation-new.pub
 ```
 
-### Publish to Ansible Galaxy
+Use a disposable VM you can snapshot and roll back.
 
-```bash
-# Requires API token
-ansible-galaxy collection publish ./krameff-ssh_key_rotation-1.0.0.tar.gz \
-  --api-key <your-api-key>
-```
+Keep generated keys out of the working tree. `.gitignore` covers the common patterns and `galaxy.yml`'s `build_ignore` excludes `test_*` as a second line of defence, but a private key that lands in a commit has to be treated as compromised regardless.
 
-## Updating Documentation
+## Documentation
 
-### Update README
+**README.md** should stay the reference for anything user-facing. Keep the overview concise, list every required and optional variable, include examples for common cases, and add a troubleshooting entry for any new failure mode.
 
-1. Keep the overview concise but comprehensive
-2. Include all required and optional variables
-3. Add examples for common use cases
-4. Update troubleshooting if adding new features
+**CHANGELOG.md** gets an entry for every change, under `## [Unreleased]`, using the categories Added, Changed, Deprecated, Removed, Fixed and Security. Link to issues or pull requests where relevant. On release, entries move from `Unreleased` into a versioned section.
 
-### Update CHANGELOG
+**House style**: no em-dashes and no emoji, in any document in this repository.
 
-1. Add entries under an "Unreleased" section
-2. Use categories: Added, Changed, Deprecated, Removed, Fixed, Security
-3. Link to GitHub issues/PRs when applicable
-4. Release notes move from "Unreleased" to a versioned section
-
-### Add Code Comments
-
-Keep comments minimal and focused on WHY, not WHAT:
+**Code comments** should explain why, not what:
 
 ```yaml
 # Good: explains the non-obvious reason for a choice
@@ -188,63 +224,53 @@ Keep comments minimal and focused on WHY, not WHAT:
 
 ## Versioning
 
-This collection follows [Semantic Versioning](https://semver.org/):
+The collection follows [Semantic Versioning](https://semver.org/):
 
-- **MAJOR** (1.0.0 → 2.0.0): Breaking changes
-  - Changes to variable names or types
-  - Removal of playbooks or features
-  - Changed behavior that could affect existing workflows
-  
-- **MINOR** (1.0.0 → 1.1.0): New features, backwards compatible
-  - New playbooks or roles
-  - New variables with sensible defaults
-  - New optional capabilities
-  
-- **PATCH** (1.0.0 → 1.0.1): Bug fixes, backwards compatible
-  - Configuration fixes
-  - Documentation fixes
-  - Small improvements that don't change behavior
+The collection is pre-1.0 and has not been released, so there is nothing published to stay
+compatible with. Until 1.0.0 ships, behaviour may change within `0.x` releases without a major
+bump; the changes are still written up in `CHANGELOG.md` so they are never a surprise. The scheme
+below applies from 1.0.0 onwards.
 
-## Contributing
+- **Major** (1.0.0 to 2.0.0), for breaking changes: renamed or retyped variables, removed playbooks or features, or changed behaviour that could affect an existing workflow.
+- **Minor** (1.0.0 to 1.1.0), for backwards-compatible features: new playbooks or roles, new variables with sensible defaults, new optional capabilities.
+- **Patch** (1.0.0 to 1.0.1), for backwards-compatible fixes: configuration fixes, documentation fixes, small improvements that do not change behaviour.
 
-### Before Submitting
+New variables should default to off or empty, so that upgrading never changes what an existing playbook run does.
 
-1. Run all tests:
-   ```bash
-   ansible-lint
-   ansible-playbook playbooks/rotate.yml --syntax-check
-   ```
+## Building and releasing
 
-2. Test against multiple OS families (Debian, RHEL)
+### Build a tarball
 
-3. Update documentation:
-   - README.md with new variables/options
-   - CHANGELOG.md with changes
-   - Code comments for non-obvious logic
+```bash
+ansible-galaxy collection build .
+# Output: ./krameff-ssh_key_rotation-0.9.0.tar.gz
+```
 
-4. Verify backwards compatibility
+`galaxy.yml`'s `build_ignore` keeps the Molecule scenarios, CI configuration, editor and agent directories, and any local inventory or key material out of the tarball.
 
-### Pull Request Checklist
+### Release
 
-- [ ] Code follows Ansible best practices
-- [ ] All tests pass
-- [ ] Documentation updated
-- [ ] CHANGELOG.md updated
-- [ ] No new dependencies without justification
-- [ ] Backwards compatible (or documented breaking change)
+Releases are cut by tagging, not by hand. Pushing a `v*` tag triggers `.github/workflows/release.yml`, which builds the collection and publishes it to Galaxy using the `GALAXY_API_KEY` repository secret. The workflow fails the build if the tag does not match the version in `galaxy.yml`.
 
-## Future Enhancements
+So the order is: bump `version` in `galaxy.yml`, move the `Unreleased` changelog entries into a versioned section, merge, then tag.
 
-See [CHANGELOG.md](CHANGELOG.md) for planned features:
+To publish by hand if you need to:
 
-- Basic key type/strength/pairing validation now runs in `roles/ssh_key_rotation/tasks/validate.yml`; richer checks (permissions, passphrase detection) are still future work
-- Per-OS customization
-- Key integrity validation module
-- Automatic rollback in the verify stage's cleanup now runs via `block`/`rescue`, restoring from the backups taken moments earlier on the same connection; a standalone break-glass rollback playbook (for recovering a host after the connection is already lost) is still future work
+```bash
+ansible-galaxy collection publish ./krameff-ssh_key_rotation-0.9.0.tar.gz \
+  --api-key <your-api-key>
+```
+
+## Future enhancements
+
+- Richer Phase 0 key validation. Type, strength and pairing checks are in `roles/ssh_key_rotation/tasks/validate.yml` already; permissions and passphrase detection are not.
+- A standalone break-glass rollback playbook. The verify stage's `block`/`rescue` restores from backups on the same still-open connection, but there is nothing to recover a host once that connection is already lost.
+- Per-OS customisation
+- A key integrity validation module
 - Multi-key rotation support
 - Async key rotation for large fleets
 
-## Troubleshooting Development
+## Troubleshooting development
 
 ### Collection import errors
 
@@ -258,19 +284,15 @@ ansible-galaxy collection build . --check
 
 ### Module not found
 
+Make sure the module is in `plugins/modules/`, then clear the cache and retry:
+
 ```bash
-# Ensure module is in plugins/modules/
-# Restart Ansible or clear cache
 rm -rf ~/.ansible/plugins/modules/
 ```
 
 ### Filter not loading
 
-```bash
-# Verify filter file is in plugins/filters/
-# Check function name matches filter invocation
-# Reload Ansible cache
-```
+Check the filter file is in `plugins/filters/`, that the function name matches the filter invocation, and reload the Ansible cache.
 
 ## Resources
 

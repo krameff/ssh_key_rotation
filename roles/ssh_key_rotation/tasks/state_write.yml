@@ -1,0 +1,66 @@
+---
+
+# Records what this run actually changed on THIS host, as a local fact under
+# /etc/ansible/facts.d, so later stages can undo exactly that and nothing else.
+#
+# Why a file on the target rather than registered variables. The verify stage's rollback needs to
+# know what the install stage did - which drop-ins it created, where it backed authorized_keys up
+# to, whether it changed the crypto policy. Registered variables do survive between plays for the
+# same host, but relying on them makes the rollback fail in ways that are worse than not having
+# it: verify can be run standalone via tasks_from, --limit can exclude a host from the install
+# play, and install's backup task is conditional, so the variable can be defined but empty. An
+# undefined variable inside a rescue: aborts the rescue, which would leave a half-changed host
+# with no rollback at all.
+#
+# Hosts genuinely differ - one has a cloud-init drop-in, the next runs FIPS, a third already has a
+# file at our drop-in path - so this state has to be per host, and the host is the only place it
+# stays true.
+#
+# It also outlives the connection, which is what makes a separate break-glass recovery run
+# possible: reconnect later, read what the last run changed, undo precisely that.
+#
+# Callers pass ssh_key_rotation_state (a dict). Anything not passed is preserved from the existing
+# fact, so install can record its half and verify can add to it without either clobbering the other.
+
+- name: State | Ensure the local facts directory exists
+  ansible.builtin.file:
+    path: /etc/ansible/facts.d
+    state: directory
+    mode: "0755"
+    owner: root
+    group: root
+  become: true
+  register: ssh_key_rotation_factsd_dir
+
+- name: State | Read any existing rotation state so this write merges rather than replaces
+  ansible.builtin.slurp:
+    src: /etc/ansible/facts.d/ssh_key_rotation.fact
+  become: true
+  failed_when: false
+  register: ssh_key_rotation_state_existing
+
+# Treated as untrusted input: it is a file on the target that a previous aborted run, or a human,
+# could have left in any shape, so an empty or non-JSON file is read as {} rather than acted on.
+#
+# startswith('{') rather than a regex on purpose. This is a YAML folded scalar, which performs NO
+# escape processing, so a pattern written as '^\\s*\\{' arrives at Jinja as a literal backslash and
+# never matches - which silently made every read look like "no prior state" and turned each write
+# into a full overwrite, losing the install stage's record by the time verify needed it.
+- name: State | Merge the new state onto whatever was already recorded
+  vars:
+    ssh_key_rotation_state_prior: >-
+      {{ (ssh_key_rotation_state_existing.content | b64decode | from_json)
+         if (ssh_key_rotation_state_existing.content is defined
+             and (ssh_key_rotation_state_existing.content | b64decode | trim).startswith('{'))
+         else {} }}
+  ansible.builtin.set_fact:
+    ssh_key_rotation_state_merged: "{{ ssh_key_rotation_state_prior | combine(ssh_key_rotation_state, recursive=True) }}"
+
+- name: State | Write the rotation state fact
+  ansible.builtin.copy:
+    dest: /etc/ansible/facts.d/ssh_key_rotation.fact
+    content: "{{ ssh_key_rotation_state_merged | to_nice_json }}\n"
+    mode: "0600"
+    owner: root
+    group: root
+  become: true

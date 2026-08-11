@@ -1,0 +1,49 @@
+---
+
+name: Molecule
+
+on:
+  push:
+    branches: [main, devel]
+  pull_request:
+    branches: [main, devel]
+  # The test platforms track the geerlingguy images by :latest, so the base images move
+  # underneath this suite between commits. A weekly run means that drift surfaces as its own
+  # red build rather than as a mystery failure on whatever unrelated PR is open at the time.
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  molecule:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # nonroot is not a variant of default for its own sake: default and rollback both enter
+        # the containers as root and rotate root, so a file left owned by root is the correct
+        # outcome there and an ownership regression cannot fail them. nonroot is the only
+        # scenario that can catch it.
+        scenario: [default, rollback, nonroot]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install Ansible, Molecule, and the docker driver
+        run: |
+          python -m pip install --upgrade pip
+          pip install "ansible>=2.18" "molecule>=25.0" "molecule-plugins[docker]"
+
+      # No separate ansible-galaxy step: the scenarios run `dependency` as the first step of
+      # their test sequence, so collection dependencies get installed the same way here and on
+      # a developer's machine.
+      - name: Run Molecule scenario
+        run: molecule test -s ${{ matrix.scenario }}
+        env:
+          PY_COLORS: "1"
+          ANSIBLE_FORCE_COLOR: "1"

@@ -1,0 +1,51 @@
+---
+
+name: Feature request
+description: Suggest a capability or change
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Please check the "Future enhancements" section of
+        [DEVELOPMENT.md](https://github.com/krameff/ssh_key_rotation/blob/main/DEVELOPMENT.md)
+        first, in case it is already on the list.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve
+      description: >-
+        Describe the situation you are actually in, not just the feature you
+        have in mind. It often turns out there is a better fit than the one
+        first thought of.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like it to do
+    validations:
+      required: true
+
+  - type: textarea
+    id: safety
+    attributes:
+      label: Effect on the safety model
+      description: >-
+        Would this change when the old key is removed, when `sshd_config` is
+        validated or backed up, or how the verify stage's rollback works? See
+        the [safety
+        model](https://github.com/krameff/ssh_key_rotation#safety-model). Say so
+        plainly if it would; that is not automatically a blocker, but it needs
+        discussing up front.
+      placeholder: "No effect, this is additive and off by default."
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you have considered
+      description: Including whether an existing variable already gets you close.

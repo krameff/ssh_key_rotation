@@ -1,0 +1,78 @@
+---
+
+# Proves - or disproves - that a given private key can actually log in to this host, by driving a
+# real ssh client from the control node.
+#
+# Why not ansible.builtin.ping. Ansible's SSH connections are multiplexed, and the default
+# ControlPath is keyed on host, port and remote user - NOT on the identity file. So a ping issued
+# after switching ansible_ssh_private_key_file can succeed over the socket opened with the PREVIOUS
+# key, reporting that a credential works when it does not. `meta: reset_connection` helps but is
+# not reliable when connection arguments differ between the reset and the next task. That false
+# PASS is unacceptable on a check whose entire purpose is to prove the operator is not locked out,
+# and it has been observed on these hosts: a rotation re-run "succeeded" against an old key that
+# had already been deleted, and only failed once multiplexing was disabled.
+#
+# ControlMaster=no plus ControlPath=none makes socket reuse impossible, so the exit code means
+# exactly what it appears to mean. IdentitiesOnly=yes stops ssh quietly falling back to an agent
+# key and passing with a different credential than the one under test. BatchMode=yes stops it
+# hanging on a passphrase or password prompt.
+#
+# Callers pass:
+#   ssh_key_rotation_probe_key      - path to the private key to test, on the control node
+#   ssh_key_rotation_probe_label    - short description used in messages, e.g. "old key"
+# Callers may pass:
+#   ssh_key_rotation_probe_required - when true (default) a failed probe fails the task; when false
+#                                     the caller inspects ssh_key_rotation_probe_result itself
+#
+# Sets ssh_key_rotation_probe_result, whose .rc is 0 only if that key genuinely authenticated.
+
+- name: "Probe | Unmultiplexed authentication test for the {{ ssh_key_rotation_probe_label }}"
+  ansible.builtin.command:
+    argv:
+      - ssh
+      - -i
+      - "{{ ssh_key_rotation_probe_key }}"
+      - -o
+      - IdentitiesOnly=yes
+      # This probe exists to answer one question: does THIS KEY authenticate. The operator's
+      # ~/.ssh/config is still honoured (ProxyJump, per-host User, and so on must keep working),
+      # but a config that turns public key authentication off - or prefers passwords - would make
+      # the probe fail regardless of whether the key is good, reporting a lockout that has not
+      # happened. Observed exactly that against a workstation whose ssh_config carried
+      # `PubkeyAuthentication no` for the target subnet. Forcing these two makes the result depend
+      # on the key and the server, not on the client's preferences.
+      - -o
+      - PubkeyAuthentication=yes
+      - -o
+      - PreferredAuthentications=publickey
+      - -o
+      - BatchMode=yes
+      - -o
+      - ControlMaster=no
+      - -o
+      - ControlPath=none
+      - -o
+      - StrictHostKeyChecking=accept-new
+      - -o
+      - ConnectTimeout=15
+      - -p
+      - "{{ ansible_port | default(22) }}"
+      - "{{ ssh_key_rotation_target_user }}@{{ ansible_host | default(inventory_hostname) }}"
+      - "true"
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  failed_when: false
+  register: ssh_key_rotation_probe_result
+
+- name: "Probe | Assert successful authentication by the {{ ssh_key_rotation_probe_label }}"
+  when: ssh_key_rotation_probe_required | default(true) | bool
+  ansible.builtin.assert:
+    that: ssh_key_rotation_probe_result.rc == 0
+    fail_msg: >-
+      The {{ ssh_key_rotation_probe_label }} ({{ ssh_key_rotation_probe_key }}) could NOT
+      authenticate as {{ ssh_key_rotation_target_user }} on this host. ssh exited
+      {{ ssh_key_rotation_probe_result.rc }}:
+      {{ ssh_key_rotation_probe_result.stderr | default('(no stderr)') | trim }}
+    success_msg: >-
+      The {{ ssh_key_rotation_probe_label }} authenticated on a fresh, unmultiplexed connection.

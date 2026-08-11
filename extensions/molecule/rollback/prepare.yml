@@ -1,0 +1,24 @@
+---
+
+# This scenario needs THREE keypairs: seed_key (pre-existing access), key_a (installed by a
+# first, successful rotation used as the "known-good" checkpoint), and key_b (the second
+# rotation, deliberately broken partway through verify, to prove the rescue block restores
+# access to key_a). It invokes the role's stages directly rather than shelling out to
+# playbooks/rotate.yml, so it needs no generated rotation_vars.yml - converge.yml sets the
+# per-rotation vars itself. Everything else is in resources/prepare.yml.
+
+- name: Prepare | Set up the containers as rotation targets
+  ansible.builtin.import_playbook: ../resources/prepare.yml
+  vars:
+    # Must match ssh_key_rotation_rollback_user in this scenario's molecule.yml. Non-root on
+    # purpose - see the comment there for why the rescue path can only be tested this way.
+    ssh_key_rotation_test_user: svcrotate
+    ssh_key_rotation_test_keys:
+      - name: seed_key
+        type: rsa
+        bits: 3072
+      - name: key_a
+        type: ed25519
+      - name: key_b
+        type: ed25519
+    ssh_key_rotation_test_seed_key: seed_key

@@ -1,0 +1,145 @@
+---
+
+# Same guarantees as the default scenario's verify, re-stated for a NON-root target user, plus
+# the ownership assertions that only mean anything when the target isn't root.
+
+- name: Verify | Inspect the post-rotation state on each container
+  hosts: rotate
+  gather_facts: false
+  vars:
+    ssh_key_rotation_test_dir: "{{ lookup('env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}"
+    ssh_key_rotation_test_user: svcrotate
+  tasks:
+    # As in the default scenario: this play reaches the containers over the Molecule docker
+    # connection, which ignores ansible_ssh_private_key_file, so this is a liveness check only.
+    # The real key-authentication proof is the second play, which drives an actual ssh client.
+    - name: Verify | Container is reachable for inspection
+      ansible.builtin.ping:
+
+    - name: Verify | Stat the rotated user's authorized_keys
+      ansible.builtin.stat:
+        path: "/home/{{ ssh_key_rotation_test_user }}/.ssh/authorized_keys"
+      register: ssh_key_rotation_ak_stat
+
+    # The regression guard this scenario exists for. The role does this work under become, so a
+    # copy that preserves only the MODE leaves the file owned by root. sshd's StrictModes then
+    # ignores it outright and refuses every key for this user - a full lockout that still looks
+    # like a successful run in the play recap.
+    - name: Verify | authorized_keys is owned by the rotated user, not root
+      ansible.builtin.assert:
+        that:
+          - ssh_key_rotation_ak_stat.stat.exists
+          - ssh_key_rotation_ak_stat.stat.pw_name == ssh_key_rotation_test_user
+          - not ssh_key_rotation_ak_stat.stat.wgrp
+          - not ssh_key_rotation_ak_stat.stat.woth
+        fail_msg: >-
+          authorized_keys is owned by {{ ssh_key_rotation_ak_stat.stat.pw_name | default('(missing)') }}
+          (mode {{ ssh_key_rotation_ak_stat.stat.mode | default('n/a') }}), not
+          {{ ssh_key_rotation_test_user }}. sshd StrictModes will ignore it and refuse every key.
+        success_msg: "authorized_keys is owned by {{ ssh_key_rotation_test_user }} and satisfies StrictModes."
+
+    # Backups land beside authorized_keys in the same .ssh directory and are written by the same
+    # become-elevated tasks, so they are checked too - a root-owned backup is what a later
+    # rollback would restore FROM, reintroducing the lockout at the worst possible moment.
+    - name: Verify | Find the backups the role left behind
+      ansible.builtin.find:
+        paths: "/home/{{ ssh_key_rotation_test_user }}/.ssh"
+        patterns: "authorized_keys.bak-*"
+      register: ssh_key_rotation_ak_backups
+
+    - name: Verify | Every authorized_keys backup is owned by the rotated user
+      ansible.builtin.assert:
+        that: ssh_key_rotation_ak_backups.files | rejectattr('pw_name', 'equalto', ssh_key_rotation_test_user) | list | length == 0
+        fail_msg: >-
+          These authorized_keys backups are not owned by {{ ssh_key_rotation_test_user }}:
+          {{ ssh_key_rotation_ak_backups.files | rejectattr('pw_name', 'equalto', ssh_key_rotation_test_user)
+             | map(attribute='path') | list }}. Restoring one of these during a rollback would
+          leave the user locked out.
+        success_msg: "All {{ ssh_key_rotation_ak_backups.files | length }} backup(s) are correctly owned."
+
+    - name: Verify | Read authorized_keys
+      ansible.builtin.slurp:
+        src: "/home/{{ ssh_key_rotation_test_user }}/.ssh/authorized_keys"
+      register: ssh_key_rotation_authorized_keys_content
+
+    # Literal `in`, never `is search`: a base64 key blob routinely contains `+`, which `search`
+    # would treat as a regex quantifier. On the negative assertion that is actively dangerous,
+    # since `not (no match)` is True and would report the old key as removed while it is present.
+    - name: Verify | New key is present in authorized_keys
+      ansible.builtin.assert:
+        that: >-
+          lookup('file', ssh_key_rotation_test_dir + '/new_key.pub').split()[1]
+          in (ssh_key_rotation_authorized_keys_content.content | b64decode)
+        fail_msg: "The new key is not in authorized_keys after rotation."
+        success_msg: "New key is present in authorized_keys."
+
+    - name: Verify | Old key has been removed from authorized_keys
+      ansible.builtin.assert:
+        that: >-
+          lookup('file', ssh_key_rotation_test_dir + '/old_key.pub').split()[1]
+          not in (ssh_key_rotation_authorized_keys_content.content | b64decode)
+        fail_msg: "The old key is STILL in authorized_keys after rotation - it should have been removed."
+        success_msg: "Old key has been removed from authorized_keys."
+
+    - name: Verify | Check effective sshd configuration
+      ansible.builtin.command: sshd -T
+      become: true
+      changed_when: false
+      register: ssh_key_rotation_sshd_effective
+
+    - name: Verify | sshd_config reflects the role's default safety settings
+      ansible.builtin.assert:
+        that:
+          - "'pubkeyauthentication yes' in ssh_key_rotation_sshd_effective.stdout | lower"
+          - "'passwordauthentication no' in ssh_key_rotation_sshd_effective.stdout | lower"
+          - "'kbdinteractiveauthentication no' in ssh_key_rotation_sshd_effective.stdout | lower"
+
+- name: Verify | Confirm real SSH auth for the non-root user after rotation
+  hosts: rotate
+  gather_facts: false
+  vars:
+    ssh_key_rotation_test_dir: "{{ lookup('env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}"
+    ssh_key_rotation_test_user: svcrotate
+    ssh_key_rotation_verify_ssh_opts: >-
+      -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+      -o IdentitiesOnly=yes -o ConnectTimeout=15
+  tasks:
+    - name: Verify | Discover this container's IP address for the real SSH checks
+      ansible.builtin.command: hostname -I
+      changed_when: false
+      register: ssh_key_rotation_verify_container_ip
+
+    # Positive control, first on purpose: a host where sshd rejects EVERY key (the exact
+    # StrictModes lockout this scenario guards against) would otherwise satisfy the old-key
+    # assertion below and pass while all access had been lost.
+    - name: Verify | NEW key authenticates over real SSH as the non-root user (positive control)
+      ansible.builtin.command: >-
+        ssh -i {{ ssh_key_rotation_test_dir }}/new_key {{ ssh_key_rotation_verify_ssh_opts }}
+        {{ ssh_key_rotation_test_user }}@{{ ssh_key_rotation_verify_container_ip.stdout.split() | first }} true
+      delegate_to: localhost
+      changed_when: false
+
+    - name: Verify | Attempt a real SSH connection with the OLD key (must be refused)
+      ansible.builtin.command: >-
+        ssh -i {{ ssh_key_rotation_test_dir }}/old_key {{ ssh_key_rotation_verify_ssh_opts }}
+        {{ ssh_key_rotation_test_user }}@{{ ssh_key_rotation_verify_container_ip.stdout.split() | first }} true
+      delegate_to: localhost
+      changed_when: false
+      failed_when: false
+      register: ssh_key_rotation_old_key_ssh
+
+    # Both conditions matter: a non-zero rc alone is also satisfied by a timeout or a refused
+    # connection, which would hide a broken environment behind a passing assertion. Requiring
+    # sshd's own "Permission denied" proves the daemon answered and rejected the key.
+    - name: Verify | Assert sshd refused the OLD key
+      ansible.builtin.assert:
+        that:
+          - ssh_key_rotation_old_key_ssh.rc != 0
+          - "'permission denied' in (ssh_key_rotation_old_key_ssh.stderr | default('') | lower)"
+        fail_msg: >-
+          Old key still authenticates after rotation - it should have been removed.
+          ssh exited {{ ssh_key_rotation_old_key_ssh.rc }};
+          stderr: {{ ssh_key_rotation_old_key_ssh.stderr | default('(none)') }}
+        success_msg: >-
+          sshd refused the old key while the new key still authenticates as
+          {{ ssh_key_rotation_test_user }} - rotation removed old access as intended.

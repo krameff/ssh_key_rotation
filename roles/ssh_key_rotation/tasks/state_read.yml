@@ -1,0 +1,29 @@
+---
+
+# Loads this host's recorded rotation state into ssh_key_rotation_recorded.
+#
+# Deliberately re-runnable, and re-run at the START OF THE RESCUE as well as at the start of the
+# verify stage. Reading it once up front is not enough: the lock-down drop-in is recorded partway
+# through the stage, so a snapshot taken beforehand knows nothing about it and the rollback would
+# leave that file behind - undoing the run everywhere except the one setting the stage exists to
+# apply. Observed exactly that before this was split out.
+#
+# The file is untrusted input: it lives on the target and an aborted run, or a person, could have
+# left it empty, truncated or hand-edited. Anything that is not a JSON object is read as {}, which
+# degrades to "no recorded state" rather than raising - and raising inside a rescue: aborts the
+# rescue, cancelling the rollback entirely.
+
+- name: State | Read this host's recorded rotation state
+  ansible.builtin.slurp:
+    src: /etc/ansible/facts.d/ssh_key_rotation.fact
+  become: true
+  failed_when: false
+  register: ssh_key_rotation_state_raw
+
+- name: State | Parse the recorded rotation state
+  ansible.builtin.set_fact:
+    ssh_key_rotation_recorded: >-
+      {{ (ssh_key_rotation_state_raw.content | b64decode | from_json)
+         if (ssh_key_rotation_state_raw.content is defined
+             and (ssh_key_rotation_state_raw.content | b64decode | trim).startswith('{'))
+         else {} }}

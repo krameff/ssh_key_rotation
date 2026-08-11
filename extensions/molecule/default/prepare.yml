@@ -1,0 +1,20 @@
+---
+
+# This scenario rotates one key to another, so it needs two keypairs: old_key (pre-authorized,
+# simulating existing access) and new_key (generated but NOT yet authorized). It drives
+# playbooks/rotate.yml as a single ansible-playbook invocation, so it also needs the generated
+# rotation_vars.yml extra-vars file. Everything else is in resources/prepare.yml.
+
+- name: Prepare | Set up the containers as rotation targets
+  ansible.builtin.import_playbook: ../resources/prepare.yml
+  vars:
+    ssh_key_rotation_test_keys:
+      - name: old_key
+        type: rsa
+        bits: 3072
+      - name: new_key
+        type: ed25519
+    ssh_key_rotation_test_seed_key: old_key
+    ssh_key_rotation_test_rotation_vars:
+      old: old_key
+      new: new_key

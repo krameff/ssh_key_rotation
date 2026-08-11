@@ -1,0 +1,43 @@
+---
+
+# Shared by install.yml and verify.yml. Works out WHERE in /etc/ssh/sshd_config this role's
+# managed block belongs, so that every directive it writes lands in the GLOBAL section.
+#
+# This exists because of a real bug. Both stages used to write settings with `lineinfile` and a
+# regexp matching the keyword anywhere in the file. `lineinfile` replaces the LAST match, and
+# `Match` blocks live at the END of sshd_config, so on any host with a
+# `Match ... PasswordAuthentication` block the edit landed INSIDE that block: it changed the
+# policy for the matched users and left the global setting untouched, which is the opposite of
+# the intent in both directions. Confirmed on Rocky 9.8.
+#
+# Placement rules, in order:
+#   1. After the `Include` line, when there is one. sshd keeps the FIRST value it sees for a
+#      keyword and the Include sits at the top, so this deliberately leaves existing drop-ins
+#      outranking us - their precedence is preserved, and the verify stage fails loudly if one
+#      of them defeats the lock-down rather than silently working around it.
+#   2. Otherwise before the first `Match`, so the block can never land inside a conditional.
+#   3. Otherwise end of file, which is still the global section when no Match block exists.
+#
+# Being early also means the block wins over any later global occurrence of the same keyword, so
+# stale duplicates further down the file do not need rewriting.
+
+- name: Resolve sshd anchor | Find sshd_config's Include and Match directives
+  ansible.builtin.command: "grep -nE '^[[:space:]]*(Include|Match)[[:space:]]' /etc/ssh/sshd_config"
+  become: true
+  changed_when: false
+  failed_when: false
+  register: ssh_key_rotation_sshd_anchors
+
+# Plain strings, empty when not applicable, rather than storing `omit` in a fact: the omit
+# placeholder is resolved when a task's arguments are templated, and round-tripping it through
+# set_fact is fragile. Callers turn "" back into omit with `| default(omit, true)`.
+- name: Resolve sshd anchor | Decide where the managed block belongs
+  vars:
+    ssh_key_rotation_has_include: "{{ ssh_key_rotation_sshd_anchors.stdout is search('(?im)^\\d+:\\s*Include\\s') }}"
+    ssh_key_rotation_has_match: "{{ ssh_key_rotation_sshd_anchors.stdout is search('(?im)^\\d+:\\s*Match\\s') }}"
+  ansible.builtin.set_fact:
+    ssh_key_rotation_block_after: "{{ '^[ \\t]*Include[ \\t]' if ssh_key_rotation_has_include | bool else '' }}"
+    ssh_key_rotation_block_before: >-
+      {{ '^[ \t]*Match[ \t]'
+         if (not (ssh_key_rotation_has_include | bool)) and (ssh_key_rotation_has_match | bool)
+         else '' }}

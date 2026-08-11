@@ -1,0 +1,30 @@
+---
+
+# Shared by install.yml and verify.yml. Both stages copy authorized_keys around while running
+# with become, so they need to know who the file must end up owned by. The primary group is
+# looked up rather than assumed equal to the username: that holds on Debian/Ubuntu USERGROUPS
+# systems, but not everywhere (e.g. a user whose primary group is `users` or `staff`), and
+# passing a non-existent group name makes the copy fail outright.
+
+# fail_key: false so a missing user leaves getent_passwd empty instead of failing the task with
+# the module's generic "One or more supplied key could not be found in the database". Without it
+# the task below never runs and the operator never sees which variable is actually wrong.
+- name: Resolve target identity | Look up the target user in passwd
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ ssh_key_rotation_target_user }}"
+    fail_key: false
+
+- name: Resolve target identity | Fail clearly if the target user does not exist on this host
+  ansible.builtin.assert:
+    that: ssh_key_rotation_target_user in ansible_facts.getent_passwd
+    fail_msg: >-
+      ssh_key_rotation_target_user ({{ ssh_key_rotation_target_user }}) does not exist on this
+      host, so its authorized_keys cannot be managed. Check ansible_user / the inventory.
+
+# getent_passwd fields are [password, uid, gid, gecos, dir, shell]; index 2 is the numeric GID.
+# A numeric GID is used directly, so no name lookup is needed and the value can never be a
+# group name that does not resolve.
+- name: Resolve target identity | Record the target user's primary GID
+  ansible.builtin.set_fact:
+    ssh_key_rotation_target_group: "{{ ansible_facts.getent_passwd[ssh_key_rotation_target_user][2] }}"

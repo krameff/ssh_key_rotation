@@ -1,0 +1,33 @@
+---
+
+# Example extra-vars file for a rotation. Copy it, fill in your own paths, and pass it with a
+# single -e instead of four:
+#
+#   cp rotation_vars.example.yml rotation_vars.yml
+#   ansible-playbook -i inventory.ini playbooks/rotate.yml -e @rotation_vars.yml
+#
+# Your copy is gitignored (see .gitignore). These are paths on the CONTROL NODE, not the target
+# hosts, and all four are required - the validate stage refuses to start without them.
+#
+# They are intentionally NOT set in roles/ssh_key_rotation/defaults/main.yml: anything defined
+# there counts as "defined", which would permanently disable the check that catches a missing or
+# misspelled variable before a single host is touched.
+
+# The key you can currently log in with. Used by the install stage to reach each host, and
+# removed from authorized_keys by the verify stage once the new key is proven to work.
+old_private_key: "~/.ssh/id_old"
+old_public_key_file: "~/.ssh/id_old.pub"
+
+# The key you are rotating TO. The verify stage reconnects with this one before anything is
+# deleted, so a bad path here fails safely rather than locking you out.
+new_private_key: "./pwc_id_ed25519"
+new_public_key_file: "./pwc_id_ed25519.pub"
+
+# Optional. The account whose authorized_keys is rotated; defaults to the inventory's
+# ansible_user. Both keys above must belong to this same user.
+# ssh_key_rotation_target_user: "ubuntu"
+
+# Optional cleanup settings, shown with their defaults.
+# ssh_key_rotation_disable_password_auth: true
+# ssh_key_rotation_disable_kbd_interactive: true
+# ssh_key_rotation_make_exclusive: false   # true leaves ONLY the new key in authorized_keys

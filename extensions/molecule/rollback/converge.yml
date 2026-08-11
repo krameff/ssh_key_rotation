@@ -1,0 +1,149 @@
+---
+
+# Runs TWO rotations against the container(s):
+#   1. seed_key -> key_a: a normal, fully successful rotation (this scenario leaves password
+#      and keyboard-interactive auth ENABLED on purpose, so run 2 below has something new to
+#      disable and therefore something that can fail).
+#   2. key_a -> key_b: install succeeds normally, but the verify stage is given a bogus
+#      ssh_key_rotation_sshd_service value. That value is only exercised once verify's block
+#      tries to reload sshd after disabling password/keyboard-interactive auth for the first
+#      time (a real, first-time sshd_config change) - by then, authorized_keys has already
+#      been backed up and had key_a removed, so this is a legitimate way to make the rescue:
+#      block in roles/ssh_key_rotation/tasks/verify.yml fire, without editing any role logic.
+#
+# This scenario invokes the role's stages directly (like playbooks/rotate.yml does) instead of
+# shelling out to that playbook, because it needs a different ssh_key_rotation_sshd_service
+# value on the second rotation's verify stage only - not achievable with a single shared
+# extra-vars file passed to one ansible-playbook invocation.
+
+- name: Converge | Validate stage (rotation 1, seed_key -> key_a)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ssh_key_rotation_test_dir: "{{ lookup('env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}"
+    old_private_key: "{{ ssh_key_rotation_test_dir }}/seed_key"
+    old_public_key_file: "{{ ssh_key_rotation_test_dir }}/seed_key.pub"
+    new_private_key: "{{ ssh_key_rotation_test_dir }}/key_a"
+    new_public_key_file: "{{ ssh_key_rotation_test_dir }}/key_a.pub"
+  tasks:
+    - name: Converge | Run role validate stage
+      ansible.builtin.include_role:
+        name: ssh_key_rotation
+        tasks_from: validate
+
+- name: Converge | Install stage (rotation 1, seed_key -> key_a)
+  hosts: rotate
+  gather_facts: true
+  vars:
+    ssh_key_rotation_test_dir: "{{ lookup('env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}"
+    old_private_key: "{{ ssh_key_rotation_test_dir }}/seed_key"
+    old_public_key_file: "{{ ssh_key_rotation_test_dir }}/seed_key.pub"
+    new_private_key: "{{ ssh_key_rotation_test_dir }}/key_a"
+    new_public_key_file: "{{ ssh_key_rotation_test_dir }}/key_a.pub"
+    ansible_ssh_private_key_file: "{{ old_private_key }}"
+    ssh_key_rotation_target_user: "{{ ssh_key_rotation_rollback_user }}"
+  tasks:
+    - name: Converge | Run role install stage
+      ansible.builtin.include_role:
+        name: ssh_key_rotation
+        tasks_from: install
+
+- name: Converge | Verify stage (rotation 1, seed_key -> key_a) - leave password/kbd auth ENABLED
+  hosts: rotate
+  gather_facts: false
+  vars:
+    ssh_key_rotation_test_dir: "{{ lookup('env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}"
+    old_public_key_file: "{{ ssh_key_rotation_test_dir }}/seed_key.pub"
+    new_private_key: "{{ ssh_key_rotation_test_dir }}/key_a"
+    new_public_key_file: "{{ ssh_key_rotation_test_dir }}/key_a.pub"
+    ansible_ssh_private_key_file: "{{ new_private_key }}"
+    ssh_key_rotation_target_user: "{{ ssh_key_rotation_rollback_user }}"
+    ssh_key_rotation_disable_password_auth: false
+    ssh_key_rotation_disable_kbd_interactive: false
+  tasks:
+    - name: Converge | Run role verify stage
+      ansible.builtin.include_role:
+        name: ssh_key_rotation
+        tasks_from: verify
+
+- name: Converge | Snapshot the known-good state after rotation 1 (the rollback checkpoint)
+  hosts: rotate
+  gather_facts: false
+  vars:
+    ssh_key_rotation_test_dir: "{{ lookup('env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}"
+    ansible_ssh_private_key_file: "{{ ssh_key_rotation_test_dir }}/key_a"
+  tasks:
+    - name: Converge | Read authorized_keys after rotation 1
+      ansible.builtin.slurp:
+        src: "/home/{{ ssh_key_rotation_rollback_user }}/.ssh/authorized_keys"
+      register: ssh_key_rotation_checkpoint_authorized_keys
+
+    - name: Converge | Save the authorized_keys checkpoint locally
+      ansible.builtin.copy:
+        content: "{{ ssh_key_rotation_checkpoint_authorized_keys.content | b64decode }}"
+        dest: "{{ ssh_key_rotation_test_dir }}/checkpoint_authorized_keys.{{ inventory_hostname }}"
+        mode: "0600"
+      delegate_to: localhost
+
+- name: Converge | Install stage (rotation 2, key_a -> key_b)
+  hosts: rotate
+  gather_facts: true
+  vars:
+    ssh_key_rotation_test_dir: "{{ lookup('env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}"
+    old_private_key: "{{ ssh_key_rotation_test_dir }}/key_a"
+    old_public_key_file: "{{ ssh_key_rotation_test_dir }}/key_a.pub"
+    new_private_key: "{{ ssh_key_rotation_test_dir }}/key_b"
+    new_public_key_file: "{{ ssh_key_rotation_test_dir }}/key_b.pub"
+    ansible_ssh_private_key_file: "{{ old_private_key }}"
+    ssh_key_rotation_target_user: "{{ ssh_key_rotation_rollback_user }}"
+  tasks:
+    - name: Converge | Run role install stage
+      ansible.builtin.include_role:
+        name: ssh_key_rotation
+        tasks_from: install
+
+- name: Converge | Verify stage (rotation 2, key_a -> key_b) - deliberately broken reload
+  hosts: rotate
+  gather_facts: false
+  vars:
+    ssh_key_rotation_test_dir: "{{ lookup('env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}"
+    old_public_key_file: "{{ ssh_key_rotation_test_dir }}/key_a.pub"
+    new_private_key: "{{ ssh_key_rotation_test_dir }}/key_b"
+    new_public_key_file: "{{ ssh_key_rotation_test_dir }}/key_b.pub"
+    ansible_ssh_private_key_file: "{{ new_private_key }}"
+    ssh_key_rotation_target_user: "{{ ssh_key_rotation_rollback_user }}"
+    ssh_key_rotation_sshd_service: "bogus-sshd-molecule-test"
+  tasks:
+    # block/rescue, not `ignore_errors` + `register` on the include_role: ignore_errors does NOT
+    # propagate into the tasks of an included role, so a failure inside verify.yml fails the play
+    # outright and any assert placed after the include never runs (the scenario could never exit 0).
+    # Wrapping it means the role's failure lands in this rescue, where it can be asserted on.
+    - name: Converge | Expect the verify stage to fail and trigger the role's rescue block
+      block:
+        - name: Converge | Run role verify stage (expected to fail and trigger the rescue block)
+          ansible.builtin.include_role:
+            name: ssh_key_rotation
+            tasks_from: verify
+
+        - name: Converge | Fail if the deliberately-broken verify stage unexpectedly succeeded
+          ansible.builtin.fail:
+            msg: >-
+              Expected rotation 2's verify stage to fail (bogus ssh_key_rotation_sshd_service),
+              proving the rescue block fires - it succeeded instead, so this test proves nothing.
+      rescue:
+        # Asserting on the rollback's own diagnostic, not merely "something failed": that message is
+        # only ever reached if the rescue block ran all the way through (restore -> reload ->
+        # connectivity check -> report). A bare `is failed` would also pass when the rescue aborted
+        # partway, which is exactly the bug this scenario exists to catch.
+        - name: Converge | Assert the rescue block ran to completion and reported the rollback
+          ansible.builtin.assert:
+            that: >-
+              'automatically rolled back' in (ansible_failed_result.msg | default(''))
+            fail_msg: >-
+              Rotation 2's verify stage failed, but not at the rollback diagnostic - the rescue
+              block did not run to completion, so access was not verified after the restore.
+              Last error was: {{ ansible_failed_result.msg | default('none') }}
+            success_msg: >-
+              Rescue block ran to completion: authorized_keys/sshd_config restored, connectivity
+              re-confirmed with the new key, and the rollback reported to the operator.

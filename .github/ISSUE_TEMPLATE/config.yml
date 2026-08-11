@@ -1,0 +1,17 @@
+---
+
+blank_issues_enabled: false
+
+contact_links:
+  - name: Lockout or other security issue
+    url: https://github.com/krameff/ssh_key_rotation/security/advisories/new
+    about: >-
+      If you have found a way this collection can lock a host out, or any other
+      security issue, please report it privately rather than opening a public
+      issue. You can also email security@krameff.com.
+
+  - name: Question about usage
+    url: https://github.com/krameff/ssh_key_rotation/discussions
+    about: >-
+      For "how do I" questions, start a discussion. Check the README
+      troubleshooting section first, it covers the common failure modes.
