@@ -73,15 +73,25 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz \
-            --title "${GITHUB_REF_NAME}" \
-            --notes "See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/CHANGELOG.md).
+          notes="See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/CHANGELOG.md).
 
           Verify this tarball came from this repository:
 
           \`\`\`
           gh attestation verify krameff-ssh_key_rotation-*.tar.gz --repo ${GITHUB_REPOSITORY}
           \`\`\`"
+          # A release may already exist for this tag, either because it was cut through the
+          # web UI (which creates the tag and so triggers this workflow) or because an earlier
+          # run failed after this point. Update it rather than failing the whole job, which
+          # would skip the Galaxy publish below.
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release edit "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --notes "$notes"
+            gh release upload "${GITHUB_REF_NAME}" dist/*.tar.gz --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz \
+              --title "${GITHUB_REF_NAME}" \
+              --notes "$notes"
+          fi
 
       - name: Publish to Ansible Galaxy
         if: startsWith(github.ref, 'refs/tags/v')
