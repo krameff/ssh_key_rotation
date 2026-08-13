@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.9.1] - 2026-08-13
+
+Added role README.md to satiffy galaxy collection requirements
+
 ## [0.9.0] - 2026-08-11
 
 First release. Nothing was published before this, so the entries below record how the
