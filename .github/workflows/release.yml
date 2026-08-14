@@ -6,6 +6,9 @@ on:
   push:
     tags:
       - "v*"
+      # Tag filters are case-sensitive, so a `V1.2.3` tag would otherwise trigger nothing at
+      # all and look like a silent success. Caught here and failed by the version check below.
+      - "V*"
   # Lets the build be exercised without cutting a tag; publishing stays gated on the tag.
   workflow_dispatch:
 
@@ -35,17 +38,28 @@ jobs:
           python -m pip install --upgrade pip
           pip install "ansible>=2.18"
 
-      # A tag of v1.2.3 must match `version: 1.2.3` in galaxy.yml. Galaxy rejects a re-upload of
-      # an existing version, so catching the mismatch here avoids a half-finished release.
-      - name: Check the tag matches galaxy.yml
-        if: startsWith(github.ref, 'refs/tags/v')
+      # The tag is the single source of truth for the released version. galaxy.yml carries a
+      # development placeholder, and this step stamps the tag's version into the copy being
+      # built, so a release cannot go out with the two disagreeing and there is no second
+      # file to remember to bump. Only the checkout is edited; nothing is committed back.
+      - name: Stamp the version from the tag
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           tag_version="${GITHUB_REF_NAME#v}"
-          galaxy_version="$(python -c "import yaml,sys; print(yaml.safe_load(open('galaxy.yml'))['version'])")"
-          if [ "$tag_version" != "$galaxy_version" ]; then
-            echo "Tag ${GITHUB_REF_NAME} does not match galaxy.yml version ${galaxy_version}" >&2
+          # Galaxy requires semantic versions, and rejects a re-upload of an existing one, so a
+          # malformed tag is caught here rather than after the build and the GitHub Release.
+          if ! printf '%s' "$tag_version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)*$'; then
+            echo "Tag ${GITHUB_REF_NAME} is not vMAJOR.MINOR.PATCH" >&2
             exit 1
           fi
+          if [ "$(grep -c '^version:' galaxy.yml)" != "1" ]; then
+            echo "Expected exactly one 'version:' line in galaxy.yml" >&2
+            exit 1
+          fi
+          sed -i "s/^version:.*/version: ${tag_version}/" galaxy.yml
+          python -c "import yaml; v = yaml.safe_load(open('galaxy.yml'))['version']; \
+            print(f'galaxy.yml version is now {v}'); \
+            raise SystemExit(0 if v == '${tag_version}' else 'version stamp did not take')"
 
       - name: Build the collection artifact
         run: ansible-galaxy collection build --output-path ./dist
@@ -60,7 +74,7 @@ jobs:
 
       # Kept for workflow_dispatch runs, where no Release is created. Expires with the run.
       - name: Upload the artifact to the workflow run
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: collection-tarball
           path: dist/*.tar.gz
