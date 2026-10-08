@@ -23,6 +23,8 @@
 # Callers may pass:
 #   ssh_key_rotation_probe_required - when true (default) a failed probe fails the task; when false
 #                                     the caller inspects ssh_key_rotation_probe_result itself
+#   ssh_key_rotation_probe_kex      - comma-separated KexAlgorithms to offer, and ONLY those (no `+`),
+#                                     so the probe passes only if one of them is actually negotiated
 #
 # Sets ssh_key_rotation_probe_result, whose .rc is 0 only if that key genuinely authenticated.
 
@@ -55,6 +57,9 @@
       - StrictHostKeyChecking=accept-new
       - -o
       - ConnectTimeout=15
+      # Pins KexAlgorithms when asked; otherwise repeats ConnectTimeout as a harmless placeholder.
+      - -o
+      - "{{ ('KexAlgorithms=' ~ ssh_key_rotation_probe_kex) if (ssh_key_rotation_probe_kex | default('') | length > 0) else 'ConnectTimeout=15' }}"
       - -p
       - "{{ ansible_port | default(22) }}"
       - "{{ ssh_key_rotation_target_user }}@{{ ansible_host | default(inventory_hostname) }}"

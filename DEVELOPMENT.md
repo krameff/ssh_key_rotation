@@ -47,7 +47,9 @@ krameff-ssh_key_rotation/
 │           ├── validate.yml              # Phase 0: local pre-flight validation
 │           ├── install.yml               # Phase 1: install the new key, prepare sshd (connect via OLD key)
 │           ├── verify.yml                # Phase 2: verify the new key, then remove the old key/legacy auth
-│           └── manage_crypto_policy.yml  # RHEL/Fedora crypto-policy logic, shared by validate.yml and install.yml
+│           ├── crypto_policy_plan.yml    # Read-only crypto-policy and FIPS checks, before any change
+│           ├── manage_crypto_policy.yml  # Applies the planned crypto-policy, shared by validate.yml and install.yml
+│           └── crypto_policy_restore.yml # Puts the previous crypto-policy back on rollback
 └── plugins/
     ├── modules/            # Custom modules (future)
     └── filters/            # Custom filters (future)

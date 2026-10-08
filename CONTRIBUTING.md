@@ -54,7 +54,7 @@ Molecule needs a working Docker or Podman socket. The scenarios pull `geerlinggu
 | Pre-flight validation, before any host is touched | `roles/ssh_key_rotation/tasks/validate.yml` |
 | Installing the new key, preparing sshd | `roles/ssh_key_rotation/tasks/install.yml` |
 | Proving the new key, removing the old one | `roles/ssh_key_rotation/tasks/verify.yml` |
-| RHEL/Fedora crypto-policy handling | `roles/ssh_key_rotation/tasks/manage_crypto_policy.yml` |
+| RHEL/Fedora crypto-policy handling | `roles/ssh_key_rotation/tasks/crypto_policy_plan.yml` (checks), `manage_crypto_policy.yml` (apply), `crypto_policy_restore.yml` (rollback) |
 | A variable's default value | `roles/ssh_key_rotation/defaults/main.yml` |
 | How the three stages are wired together | `playbooks/rotate.yml` |
 | Functional tests | `extensions/molecule/default/`, `nonroot/`, `rollback/` |

@@ -36,6 +36,20 @@ ssh_key_rotation_crypto_policy_setting: "DEFAULT:PQ"
 # has active instead of replacing the whole policy.
 ssh_key_rotation_crypto_policy_add_modules: []
 
+# Fail (and roll back) when a requested PQC algorithm is not in sshd's effective config, and prove in the verify
+# stage that the requested key exchange is really negotiated before the old key is removed. false restores the old
+# behaviour: a warning, then a rotation that silently falls back to classical algorithms. See PQC.md.
+ssh_key_rotation_pqc_require_effective: true
+
+# Conflicts found before any change stop the run; each override below proceeds anyway. See PQC.md.
+# FIPS mode on AlmaLinux or Rocky Linux: the community packages are not FIPS 140-3 validated builds.
+ssh_key_rotation_accept_fips_validation_gap: false
+# On a FIPS-mode host, algorithms or a crypto policy outside its FIPS policy: sshd advertises them, then drops every
+# client that picks them. Set true only with console access.
+ssh_key_rotation_allow_non_fips_algorithms: false
+# A crypto policy leaving only post-quantum key exchange (RHEL 10.2's FUTURE), cutting off clients without PQC.
+ssh_key_rotation_allow_pqc_only_kex: false
+
 # Maps an ssh-keygen -l key type to its real signature algorithm(s) for PubkeyAcceptedAlgorithms (FIPS drops ssh-ed25519); see README's Key Validation.
 ssh_key_rotation_key_type_signature_algorithms:
   ED25519: ["ssh-ed25519"]

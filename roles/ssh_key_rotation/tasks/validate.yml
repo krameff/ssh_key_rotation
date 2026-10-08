@@ -167,12 +167,19 @@
       PubkeyAcceptedAlgorithms negotiation may fail later.
 
 # Opt-in control-node crypto-policy management, detected via the tool rather than an OS-family fact (gather_facts is false for this stage).
-# Shared with install.yml's target-host equivalent; see tasks/manage_crypto_policy.yml.
-- name: Validate | Manage the control node's system-wide crypto policy
-  ansible.builtin.include_tasks: manage_crypto_policy.yml
+# Shared with install.yml's target-host equivalent; see tasks/crypto_policy_plan.yml and manage_crypto_policy.yml.
+# The FIPS checks apply here too: a control node is often a bastion people SSH into, and its own sshd
+# picks up whatever policy is set here at its next restart.
+- name: Validate | Plan the control node's crypto-policy change and refuse anything that would lock clients out
+  ansible.builtin.include_tasks: crypto_policy_plan.yml
   vars:
     ssh_key_rotation_crypto_policy_context: "the control node"
     ssh_key_rotation_crypto_policy_no_tool_followup: >-
       Skipping control-node policy management; the pqc_*_algorithms vars will still be
       injected per-connection via ansible_ssh_extra_args in later stages.
+
+- name: Validate | Manage the control node's system-wide crypto policy
+  ansible.builtin.include_tasks: manage_crypto_policy.yml
+  vars:
+    ssh_key_rotation_crypto_policy_context: "the control node"
     ssh_key_rotation_crypto_policy_notify_reload: false
