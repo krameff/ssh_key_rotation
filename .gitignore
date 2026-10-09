@@ -26,6 +26,7 @@ venv/
 ansible_collections/
 inventory.ini
 .mcp*
+extensions/vhs/
 
 # SSH key material - QUICKSTART.md has users generate keys in this directory;
 # never commit private keys. Public keys (*.pub) are safe and stay tracked.
@@ -47,3 +48,6 @@ test_*
 
 # Personal copy of rotation_vars.example.yml; contains local key paths, not for committing.
 rotation_vars.yml
+
+# Rendered VHS recordings (extensions/vhs/pqc_live.tape); regenerate rather than commit.
+extensions/vhs/output/

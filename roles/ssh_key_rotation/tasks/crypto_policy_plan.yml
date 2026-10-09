@@ -1,0 +1,323 @@
+---
+
+# Read-only half of the crypto-policy handling: works out what would change and stops on anything
+# unsafe, BEFORE the caller touches the host. manage_crypto_policy.yml is the half that applies it.
+#
+# Why everything is checked up front: `update-crypto-policies --set` restarts sshd by itself
+# (verified on AlmaLinux 10.1), so whatever a new policy makes sshd offer is live for the very next
+# connection. A policy that locks clients out has to be caught before it is applied, or not at all.
+#
+# Every stop names its override, except one that would cut off this playbook's own connection.
+#
+# Callers must pass:
+#   ssh_key_rotation_crypto_policy_context           - noun phrase for task names/messages
+#   ssh_key_rotation_crypto_policy_no_tool_followup  - what happens next if the tool is missing
+# Callers may pass:
+#   ssh_key_rotation_crypto_policy_on_target         - true on a target host (default false): adds the
+#                                                       checks on who could still connect, which need
+#                                                       ssh_key_rotation_new_key_type and old_public_key_file
+#
+# Sets, for manage_crypto_policy.yml:
+#   ssh_key_rotation_crypto_policy_change     - true if the policy would change (always defined)
+#   ssh_key_rotation_crypto_policy_current    - registered `update-crypto-policies --show`
+#   ssh_key_rotation_crypto_policy_desired    - the policy string that would be applied
+
+# --- FIPS mode ---------------------------------------------------------------------------------
+
+- name: "Crypto policy plan | Read the kernel FIPS flag on {{ ssh_key_rotation_crypto_policy_context }}"
+  ansible.builtin.command: cat /proc/sys/crypto/fips_enabled
+  changed_when: false
+  failed_when: false
+  register: ssh_key_rotation_fips_flag
+
+# A missing file means a kernel without FIPS support. Any OTHER failure to read it is treated as
+# FIPS mode: guessing "not FIPS" is the guess that can lock people out.
+- name: "Crypto policy plan | Decide whether FIPS mode is on for {{ ssh_key_rotation_crypto_policy_context }}"
+  ansible.builtin.set_fact:
+    ssh_key_rotation_fips_mode: >-
+      {{ (ssh_key_rotation_fips_flag.rc == 0 and ssh_key_rotation_fips_flag.stdout | trim == '1')
+         or (ssh_key_rotation_fips_flag.rc != 0 and 'No such file' not in ssh_key_rotation_fips_flag.stderr) }}
+
+# FIPS mode is enforcement, not certification. On AlmaLinux and Rocky Linux the FIPS 140-3 validated
+# builds come from vendors (TuxCare, CIQ), not the community repositories, and the role cannot tell
+# which a host runs, so every rotation there needs an explicit acknowledgement. Facts exist only on
+# targets, so this never fires on the control node. Details in PQC.md.
+- name: "Crypto policy plan | Stop on the FIPS 140-3 validation gap unless acknowledged on {{ ssh_key_rotation_crypto_policy_context }}"
+  when:
+    - ssh_key_rotation_fips_mode | bool
+    - (ansible_facts.distribution | default('')) in ['AlmaLinux', 'Rocky']
+    - not (ssh_key_rotation_accept_fips_validation_gap | bool)
+  ansible.builtin.fail:
+    msg: >-
+      FIPS validation gap: {{ ssh_key_rotation_crypto_policy_context }} runs {{ ansible_facts.distribution }}
+      {{ ansible_facts.distribution_version }} in FIPS mode. FIPS mode enforces FIPS rules, but the community
+      packages are not FIPS 140-3 validated builds. Nothing has been changed. Set
+      ssh_key_rotation_accept_fips_validation_gap=true if this host runs vendor-validated packages or you
+      accept the gap. See PQC.md, "FIPS mode is not FIPS validation".
+
+# The host's own FIPS policy is the authority on what its sshd supports in FIPS mode: it is the file
+# that strips MLKEM768-X25519 from OpenSSH on AlmaLinux 10.1, and the one that adds the NIST-curve
+# hybrids on RHEL 10.2. Comparing against it needs no hard-coded algorithm list.
+- name: FIPS-mode checks
+  when: ssh_key_rotation_fips_mode | bool
+  block:
+    - name: "Crypto policy plan | Read the FIPS policy's sshd settings on {{ ssh_key_rotation_crypto_policy_context }}"
+      ansible.builtin.command: cat /usr/share/crypto-policies/FIPS/opensshserver.txt
+      changed_when: false
+      failed_when: false
+      register: ssh_key_rotation_fips_policy_render
+
+    # opensshserver.txt is "Keyword value" per line; read it as a dict.
+    - name: "Crypto policy plan | Parse the FIPS policy's sshd settings on {{ ssh_key_rotation_crypto_policy_context }}"
+      ansible.builtin.set_fact:
+        ssh_key_rotation_fips_sshd: >-
+          {{ dict(ssh_key_rotation_fips_policy_render.stdout.splitlines() | map('split')
+                  | selectattr('1', 'defined') | rejectattr('2', 'defined') | list) }}
+
+    # With no FIPS policy file to compare against (a FIPS host without crypto-policies), names using
+    # primitives FIPS does not approve are refused instead.
+    - name: "Crypto policy plan | Refuse requested algorithms that FIPS mode would make sshd advertise but reject on {{ ssh_key_rotation_crypto_policy_context }}"
+      when: not (ssh_key_rotation_allow_non_fips_algorithms | bool)
+      vars:
+        _f: "{{ ssh_key_rotation_fips_sshd }}"
+        _refused: >-
+          {{ (ssh_key_rotation_pqc_kex_algorithms | difference((_f.KexAlgorithms | default('')).split(','))
+              + ssh_key_rotation_pqc_pubkey_algorithms
+                | difference(((_f.PubkeyAcceptedAlgorithms | default('')) ~ ',' ~ (_f.HostKeyAlgorithms | default(''))).split(','))
+              + ssh_key_rotation_pqc_ca_signature_algorithms | difference((_f.CASignatureAlgorithms | default('')).split(',')))
+             if _f | length > 0
+             else ((ssh_key_rotation_pqc_kex_algorithms + ssh_key_rotation_pqc_pubkey_algorithms
+                    + ssh_key_rotation_pqc_ca_signature_algorithms)
+                   | select('search', '(?i)x25519|x448|curve25519|curve448|sntrup|ed25519|ed448') | list) }}
+      ansible.builtin.assert:
+        that: _refused | length == 0
+        fail_msg: >-
+          {{ ssh_key_rotation_crypto_policy_context | capitalize }} is in FIPS mode and {{ _refused }} are not in
+          its FIPS policy. sshd would advertise them, then reject them mid-handshake ("not allowed in FIPS
+          mode"), dropping every client that prefers them - this playbook included - before any rollback
+          could run. Nothing has been changed. Remove them, or set
+          ssh_key_rotation_allow_non_fips_algorithms=true only with console access.
+        success_msg: "No requested algorithm is outside FIPS mode on {{ ssh_key_rotation_crypto_policy_context }}."
+
+# --- Desired policy ------------------------------------------------------------------------------
+
+- name: Desired crypto policy
+  when: ssh_key_rotation_manage_crypto_policy | bool
+  block:
+    - name: "Crypto policy plan | Check whether the crypto-policies tool is present on {{ ssh_key_rotation_crypto_policy_context }}"
+      ansible.builtin.command: command -v update-crypto-policies
+      changed_when: false
+      failed_when: false
+      register: ssh_key_rotation_crypto_policies_tool
+
+    - name: "Crypto policy plan | Warn if manage_crypto_policy is set but the crypto-policies tool is missing on {{ ssh_key_rotation_crypto_policy_context }}"
+      when: ssh_key_rotation_crypto_policies_tool.rc != 0
+      ansible.builtin.debug:
+        msg: >-
+          ssh_key_rotation_manage_crypto_policy is true, but update-crypto-policies was not
+          found on {{ ssh_key_rotation_crypto_policy_context }} (it's RHEL/Fedora-only tooling).
+          {{ ssh_key_rotation_crypto_policy_no_tool_followup }}
+
+    - name: "Crypto policy plan | Check the current system-wide crypto policy on {{ ssh_key_rotation_crypto_policy_context }}"
+      when: ssh_key_rotation_crypto_policies_tool.rc == 0
+      ansible.builtin.command: update-crypto-policies --show
+      changed_when: false
+      register: ssh_key_rotation_crypto_policy_current
+
+    # add_modules merges onto the host's CURRENT policy rather than replacing it; otherwise the setting is used as-is.
+    - name: "Crypto policy plan | Work out the desired crypto policy for {{ ssh_key_rotation_crypto_policy_context }}"
+      when: ssh_key_rotation_crypto_policies_tool.rc == 0
+      vars:
+        _current: "{{ ssh_key_rotation_crypto_policy_current.stdout | trim }}"
+      ansible.builtin.set_fact:
+        ssh_key_rotation_crypto_policy_desired: >-
+          {{ ((_current.split(':') + (ssh_key_rotation_crypto_policy_add_modules | map('upper') | list
+                                      | difference(_current.split(':') | map('upper') | list))) | join(':'))
+             if ssh_key_rotation_crypto_policy_add_modules | length > 0
+             else ssh_key_rotation_crypto_policy_setting }}
+
+    # BASE:MODULE (e.g. DEFAULT:PQ) needs a MODULE.pmod under /usr/share or /etc crypto-policies modules dirs.
+    - name: "Crypto policy plan | Discover available crypto-policy subpolicy modules on {{ ssh_key_rotation_crypto_policy_context }}"
+      when:
+        - ssh_key_rotation_crypto_policies_tool.rc == 0
+        - "':' in ssh_key_rotation_crypto_policy_desired"
+      ansible.builtin.find:
+        paths:
+          - /usr/share/crypto-policies/policies/modules
+          - /etc/crypto-policies/policies/modules
+        patterns: '*.pmod'
+      register: ssh_key_rotation_crypto_policy_modules
+      failed_when: false
+
+    # PQ.pmod exists only on RHEL 9.7+. EL10 has none, because its base policies already enable ML-KEM.
+    - name: "Crypto policy plan | Fail if the desired crypto policy references a subpolicy module missing on {{ ssh_key_rotation_crypto_policy_context }}"
+      when: ssh_key_rotation_crypto_policy_modules.files is defined
+      vars:
+        _missing: >-
+          {{ (ssh_key_rotation_crypto_policy_desired.split(':')[1:] | map('upper') | list)
+             | difference(ssh_key_rotation_crypto_policy_modules.files | map(attribute='path')
+                           | map('basename') | map('regex_replace', '\.pmod$', '') | map('upper') | list) }}
+      ansible.builtin.assert:
+        that: _missing | length == 0
+        fail_msg: >-
+          Desired crypto policy "{{ ssh_key_rotation_crypto_policy_desired }}" needs module(s) {{ _missing }},
+          not found under /usr/share/crypto-policies/policies/modules/ or
+          /etc/crypto-policies/policies/modules/ on {{ ssh_key_rotation_crypto_policy_context }}.
+          {{ 'PQ exists only on RHEL 9.7 and later 9.x; EL10 has none, since its DEFAULT already enables ML-KEM. '
+             if 'PQ' in _missing else '' }}Nothing has been changed.
+        success_msg: "All subpolicy modules in the desired crypto policy exist on {{ ssh_key_rotation_crypto_policy_context }}."
+
+# Always defined, so the apply half and the install stage can test one fact.
+- name: "Crypto policy plan | Decide whether the crypto policy would change on {{ ssh_key_rotation_crypto_policy_context }}"
+  ansible.builtin.set_fact:
+    ssh_key_rotation_crypto_policy_change: >-
+      {{ (ssh_key_rotation_manage_crypto_policy | bool)
+         and (ssh_key_rotation_crypto_policies_tool.rc | default(1)) == 0
+         and (ssh_key_rotation_crypto_policy_current.stdout | default('') | trim) != (ssh_key_rotation_crypto_policy_desired | default('')) }}
+
+# Renders the desired policy into a scratch directory with the package's own generator and reads what
+# sshd would be given. Nothing under /etc is changed. The generator also looks for modules in its
+# working directory, which is how local modules under /etc/crypto-policies/policies/modules are found.
+- name: "Crypto policy plan | Render the desired crypto policy's sshd settings without applying it on {{ ssh_key_rotation_crypto_policy_context }}"
+  when: ssh_key_rotation_crypto_policy_change | bool
+  ansible.builtin.shell: |
+    out="$(mktemp -d)"
+    trap 'rm -rf "$out"' EXIT
+    cd /etc/crypto-policies/policies/modules 2>/dev/null || cd /
+    /usr/share/crypto-policies/python/build-crypto-policies.py --policy "$SKR_POLICY" \
+      /usr/share/crypto-policies/policies "$out" >/dev/null 2>&1 || true
+    f="$out/$SKR_POLICY/opensshserver.txt"
+    [ -s "$f" ] || exit 3
+    cat "$f"
+  args:
+    executable: "{{ ssh_key_rotation_os_default_shell }}"
+  environment:
+    SKR_POLICY: "{{ ssh_key_rotation_crypto_policy_desired }}"
+  changed_when: false
+  failed_when: false
+  register: ssh_key_rotation_crypto_policy_desired_render
+
+# Empty when there is nothing to check, or the policy could not be rendered.
+- name: "Crypto policy plan | Parse the desired crypto policy's sshd settings on {{ ssh_key_rotation_crypto_policy_context }}"
+  ansible.builtin.set_fact:
+    ssh_key_rotation_desired_sshd: >-
+      {{ dict(ssh_key_rotation_crypto_policy_desired_render.stdout.splitlines() | map('split')
+              | selectattr('1', 'defined') | rejectattr('2', 'defined') | list)
+         if (ssh_key_rotation_crypto_policy_desired_render.rc | default(1)) == 0 else {} }}
+
+# On a FIPS host an unrenderable policy is refused: unknown is not safe.
+- name: "Crypto policy plan | Refuse a crypto policy that would lock clients out of a FIPS-mode {{ ssh_key_rotation_crypto_policy_context }}"
+  when:
+    - ssh_key_rotation_fips_mode | bool
+    - ssh_key_rotation_crypto_policy_change | bool
+    - not (ssh_key_rotation_allow_non_fips_algorithms | bool)
+  vars:
+    _f: "{{ ssh_key_rotation_fips_sshd }}"
+    _w: "{{ ssh_key_rotation_desired_sshd }}"
+    _beyond: >-
+      {{ (((_w.KexAlgorithms | default('')).split(',') | difference((_f.KexAlgorithms | default('')).split(',')))
+          + ((_w.HostKeyAlgorithms | default('')).split(',') | difference((_f.HostKeyAlgorithms | default('')).split(',')))
+          + ((_w.PubkeyAcceptedAlgorithms | default('')).split(',') | difference((_f.PubkeyAcceptedAlgorithms | default('')).split(',')))
+          + ((_w.CASignatureAlgorithms | default('')).split(',') | difference((_f.CASignatureAlgorithms | default('')).split(','))))
+         | reject('equalto', '') | unique | list }}
+  ansible.builtin.assert:
+    that:
+      - _w | length > 0
+      - _f | length > 0
+      - _beyond | length == 0
+    fail_msg: >-
+      {{ ssh_key_rotation_crypto_policy_context | capitalize }} is in FIPS mode. Switching to
+      "{{ ssh_key_rotation_crypto_policy_desired }}" would make sshd offer
+      {{ (_beyond | join(', ')) if (_w | length > 0 and _f | length > 0) else '(could not be checked in advance)' }},
+      outside its FIPS policy. sshd advertises such algorithms, then rejects them mid-handshake, dropping
+      every client that prefers them - this playbook included. Nothing has been changed. Keep the base
+      policy FIPS and add only modules that stay within it (for example NO-PQ), or set
+      ssh_key_rotation_allow_non_fips_algorithms=true only with console access.
+    success_msg: "The desired crypto policy keeps sshd within FIPS mode on {{ ssh_key_rotation_crypto_policy_context }}."
+
+- name: "Crypto policy plan | Warn that the desired crypto policy could not be checked in advance on {{ ssh_key_rotation_crypto_policy_context }}"
+  when:
+    - not (ssh_key_rotation_fips_mode | bool)
+    - ssh_key_rotation_crypto_policy_change | bool
+    - ssh_key_rotation_desired_sshd | length == 0
+  ansible.builtin.debug:
+    msg: >-
+      The desired crypto policy "{{ ssh_key_rotation_crypto_policy_desired }}" could not be rendered in
+      advance on {{ ssh_key_rotation_crypto_policy_context }}, so the checks on who could still connect
+      were skipped. The post-change checks and rollback still apply.
+
+# --- Who could still connect ---------------------------------------------------------------------
+
+# After the change, could this playbook still connect - and could anyone without post-quantum
+# support? Targets only: the control node's policy governs its own client, not who can reach it.
+- name: Who could still connect
+  when:
+    - ssh_key_rotation_crypto_policy_on_target | default(false) | bool
+    - ssh_key_rotation_desired_sshd | length > 0
+  vars:
+    _w: "{{ ssh_key_rotation_desired_sshd }}"
+  block:
+    - name: "Crypto policy plan | List what this playbook's ssh client supports, for {{ ssh_key_rotation_crypto_policy_context }}"
+      ansible.builtin.command: "ssh -Q {{ item }}"
+      loop: [kex, key-sig, cipher]
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      failed_when: false
+      register: ssh_key_rotation_client_supports
+
+    - name: "Crypto policy plan | Read the old key's type, for {{ ssh_key_rotation_crypto_policy_context }}"
+      ansible.builtin.command: "ssh-keygen -lf {{ old_public_key_file }}"
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      failed_when: false
+      register: ssh_key_rotation_old_key_info
+
+    # No override: the change would cut off the connection this run depends on, and it is live at once.
+    # Skipped if the client could not be queried (`ssh -Q` failed): unknown, not a conflict.
+    - name: "Crypto policy plan | Refuse a crypto policy that would lock this playbook out of {{ ssh_key_rotation_crypto_policy_context }}"
+      vars:
+        _c: "{{ ssh_key_rotation_client_supports.results | map(attribute='stdout_lines') | list }}"
+        _old_type: "{{ ssh_key_rotation_old_key_info.stdout | default('') | regex_search('\\(([^)]+)\\)\\s*$', '\\1') | default([''], true) | first }}"
+        _sigs: "{{ ssh_key_rotation_key_type_signature_algorithms }}"
+        _accepts: "{{ (_w.PubkeyAcceptedAlgorithms | default('')).split(',') }}"
+        _problems: >-
+          {{ (['no key exchange algorithm in common']
+                if ('KexAlgorithms' in _w and (_w.KexAlgorithms.split(',') | intersect(_c[0])) | length == 0) else [])
+             + (['no host key algorithm in common']
+                if ('HostKeyAlgorithms' in _w and (_w.HostKeyAlgorithms.split(',') | intersect(_c[1])) | length == 0) else [])
+             + (['no cipher in common']
+                if ('Ciphers' in _w and (_w.Ciphers.split(',') | intersect(_c[2])) | length == 0) else [])
+             + (['the new ' ~ ssh_key_rotation_new_key_type ~ ' key would be rejected']
+                if ('PubkeyAcceptedAlgorithms' in _w
+                    and (_accepts | intersect(_sigs[ssh_key_rotation_new_key_type] | default([ssh_key_rotation_new_key_type | lower]))) | length == 0) else [])
+             + (['the old ' ~ _old_type ~ ' key this run is connected with would be rejected']
+                if (_old_type | length > 0 and 'PubkeyAcceptedAlgorithms' in _w
+                    and (_accepts | intersect(_sigs[_old_type] | default([_old_type | lower]))) | length == 0) else []) }}
+      ansible.builtin.assert:
+        that: >-
+          (ssh_key_rotation_client_supports.results | map(attribute='rc') | list) != [0, 0, 0]
+          or _problems | length == 0
+        fail_msg: >-
+          Switching {{ ssh_key_rotation_crypto_policy_context }} to "{{ ssh_key_rotation_crypto_policy_desired }}"
+          would leave this rotation unable to connect or finish: {{ _problems | join('; ') }}, between sshd
+          under the new policy and this control node's ssh client. update-crypto-policies restarts sshd at
+          once, so this would be live before any rollback could run. Nothing has been changed. Run from a control node whose OpenSSH
+          supports the new policy, or choose another policy.
+        success_msg: "This playbook could still connect to {{ ssh_key_rotation_crypto_policy_context }} under the desired crypto policy."
+
+    # RHEL 10.2's FUTURE policy is the case in point: it allows only hybrid ML-KEM key exchange, so
+    # every client without post-quantum support - older OpenSSH, other SSH libraries - is cut off.
+    - name: "Crypto policy plan | Stop on a crypto policy that leaves only post-quantum key exchange on {{ ssh_key_rotation_crypto_policy_context }}"
+      when: not (ssh_key_rotation_allow_pqc_only_kex | bool)
+      vars:
+        _kex: "{{ (_w.KexAlgorithms | default('')).split(',') | reject('equalto', '') | list }}"
+      ansible.builtin.assert:
+        that: _kex | length == 0 or _kex | reject('search', '(?i)mlkem|sntrup') | list | length > 0
+        fail_msg: >-
+          "{{ ssh_key_rotation_crypto_policy_desired }}" would leave {{ ssh_key_rotation_crypto_policy_context }}
+          with only post-quantum key exchange ({{ _kex | join(',') }}), cutting off every SSH client without
+          PQC support. Nothing has been changed. If every client that needs this host supports these
+          algorithms, set ssh_key_rotation_allow_pqc_only_kex=true.
+        success_msg: "The desired crypto policy keeps a classical key exchange on {{ ssh_key_rotation_crypto_policy_context }}."

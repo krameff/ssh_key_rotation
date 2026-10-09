@@ -39,6 +39,20 @@
     fail_msg: "New key did not authenticate - aborting before removing the old key."
     success_msg: "New (PwC) key verified. Proceeding to remove the old key."
 
+# The ping above proves the new key, not the algorithm: Ansible's connection offers the requested
+# PQC key exchange with `+`, so a classical fallback passes it just as well. This probe offers ONLY
+# the requested algorithms, on a fresh unmultiplexed connection, so it passes only if post-quantum
+# key exchange really is negotiated end to end - checked before anything below removes the old key.
+- name: Verify | New KEY | Prove the requested PQC key exchange is actually negotiated
+  when:
+    - ssh_key_rotation_pqc_require_effective | bool
+    - ssh_key_rotation_pqc_kex_algorithms | length > 0
+  ansible.builtin.include_tasks: probe_key.yml
+  vars:
+    ssh_key_rotation_probe_key: "{{ new_private_key }}"
+    ssh_key_rotation_probe_label: "new key, offering only {{ ssh_key_rotation_pqc_kex_algorithms | join(',') }}"
+    ssh_key_rotation_probe_kex: "{{ ssh_key_rotation_pqc_kex_algorithms | join(',') }}"
+
 # Everything below removes access (the old key, then optionally password/keyboard-interactive auth), so
 # if any of it fails partway through, the rescue: section below automatically restores authorized_keys
 # and sshd_config from the backups taken here and fails loudly - rather than leaving the host half-changed.
@@ -394,72 +408,52 @@
       register: ssh_key_rotation_rollback_reload
       ignore_errors: true
 
-    # The old key is proven to work BEFORE anything is removed from authorized_keys. Restoring the
-    # pre-install file deletes the new key, and if the old key then turns out not to work - a
-    # previous run used make_exclusive, the key is passphrase-protected, or a crypto policy no
-    # longer accepts its algorithm - that would delete the last usable credential from a host we
-    # are still connected to, with the multiplexed session hiding it until it drops.
     # Restoring the pre-install file is what puts the OLD key back: this stage removed it before
     # failing, and leaving it removed is not "as we found it".
     #
+    # ONE write, with the new key already in it. This play is connected with the NEW key, and the
+    # pre-install file does not contain it. Writing that file and adding the new key back as a second
+    # task left a gap in which the host had no copy of the key this play authenticates with; any
+    # fresh connection in that gap - every one, without SSH multiplexing - was refused, the rescue
+    # died UNREACHABLE half way, and the new key was never put back, the crypto policy never restored
+    # and the rollback never recorded. Observed exactly that on AlmaLinux 10.1 and Rocky Linux 9.8.
+    #
     # Deliberately NOT gated on probing the old key first. That ordering is circular - the old key
-    # has already been removed by this point, so a probe of it cannot succeed, and gating on it
-    # meant the restore never ran. The restore is safe without it: the new key is put straight back
-    # alongside the old one below, so the host is never left with fewer credentials than it had a
-    # moment earlier. sshd reads authorized_keys per new connection, so an established session is
-    # unaffected either way.
-    - name: Rollback | Restore the pre-install authorized_keys
+    # has already been removed by this point, so a probe of it cannot succeed. The restore is safe
+    # without it: the host is never left with fewer credentials than it had a moment earlier.
+    - name: Rollback | Read the pre-install authorized_keys backup
       when: (ssh_key_rotation_recorded.authorized_keys | default({})).backup | default(none) is not none
-      ansible.builtin.copy:
+      ansible.builtin.slurp:
         src: "{{ ssh_key_rotation_recorded.authorized_keys.backup }}"
+      become: true
+      failed_when: false
+      register: ssh_key_rotation_rollback_ak_backup
+
+    - name: Rollback | Restore the pre-install authorized_keys, with the new key in the same write
+      when: ssh_key_rotation_rollback_ak_backup.content is defined
+      vars:
+        _old_text: "{{ ssh_key_rotation_rollback_ak_backup.content | b64decode }}"
+        _new: "{{ (lookup('file', new_public_key_file, errors='ignore') | default('', true) | trim) if new_public_key_file is defined else '' }}"
+        # Matched on the base64 key blob, so a copy with different options or comment still counts.
+        _new_blob: "{{ _new.split()[1] if (_new.split() | length > 1) else '' }}"
+      ansible.builtin.copy:
+        # A literal block, so the line breaks are real ones; a blank trailing line is harmless.
+        content: |
+          {{ _old_text | trim }}
+          {{ _new if (_new_blob | length > 0 and _new_blob not in _old_text) else '' }}
         dest: "~{{ ssh_key_rotation_target_user }}/.ssh/authorized_keys"
-        remote_src: true
-        mode: preserve
+        mode: "0600"
         owner: "{{ ssh_key_rotation_target_user }}"
         group: "{{ ssh_key_rotation_recorded.target_group | default(ssh_key_rotation_target_group) }}"
       become: true
       register: ssh_key_rotation_rollback_ak_restored
 
-    # Default: old key back AND new key kept. Removing the new key would leave the host depending
-    # solely on the old key working, which is not guaranteed - a previous run may have used
-    # make_exclusive, the key may be passphrase-protected, or a crypto policy may no longer accept
-    # its algorithm. Keeping both means the rollback cannot cost anyone access.
-    - name: Rollback | Put the new key back alongside the restored old key
-      when:
-        - not (ssh_key_rotation_rollback_remove_new_key | bool)
-        - ssh_key_rotation_rollback_ak_restored is defined and ssh_key_rotation_rollback_ak_restored is changed
-      ansible.posix.authorized_key:
-        user: "{{ ssh_key_rotation_target_user }}"
-        key: "{{ lookup('file', new_public_key_file) }}"
-        state: present
-        exclusive: false
-      become: true
-
-    # Safety net for the exact-restore mode: if the old key turns out not to work, the host would
-    # now have no usable credential at all, so the new key goes back regardless of the setting.
-    - name: Rollback | Check the old key works when the new key was deliberately removed
-      when:
-        - ssh_key_rotation_rollback_remove_new_key | bool
-        - ssh_key_rotation_rollback_ak_restored is defined and ssh_key_rotation_rollback_ak_restored is changed
-        - old_private_key is defined
-      ansible.builtin.include_tasks: probe_key.yml
-      vars:
-        ssh_key_rotation_probe_key: "{{ old_private_key }}"
-        ssh_key_rotation_probe_label: old key
-        ssh_key_rotation_probe_required: false
-
-    - name: Rollback | Re-install the new key because the old key could not authenticate
-      when:
-        - ssh_key_rotation_rollback_remove_new_key | bool
-        - ssh_key_rotation_rollback_ak_restored is defined and ssh_key_rotation_rollback_ak_restored is changed
-        - ssh_key_rotation_probe_result is defined and ssh_key_rotation_probe_result.rc != 0
-      ansible.posix.authorized_key:
-        user: "{{ ssh_key_rotation_target_user }}"
-        key: "{{ lookup('file', new_public_key_file) }}"
-        state: present
-        exclusive: false
-      become: true
-      register: ssh_key_rotation_rollback_new_key_readded
+    # "Ran", not "changed": when verify failed before the old key was removed, the restored file can be
+    # byte-identical to the current one, and the policy restore below must still happen. A failed
+    # write would have aborted the rescue, so "not skipped" means it succeeded.
+    - name: Rollback | Note whether authorized_keys was restored
+      ansible.builtin.set_fact:
+        ssh_key_rotation_rollback_ak_done: "{{ ssh_key_rotation_rollback_ak_restored is defined and ssh_key_rotation_rollback_ak_restored is not skipped }}"
 
     # StrictModes gate: sshd silently IGNORES an authorized_keys not owned by the target user,
     # refusing every key for that account. A restore that gets ownership wrong is itself a lockout,
@@ -481,6 +475,36 @@
           {{ ssh_key_rotation_rollback_ak_stat.stat.mode | default('n/a') }}. sshd StrictModes will
           ignore it and refuse every key for this user. Fix ownership before closing your session.
 
+    # Recorded, and ownership checked, BEFORE the crypto policy flips back: after that, the new key
+    # this play connects with may no longer be accepted, and without multiplexing nothing more could run.
+    - name: Rollback | Record the rollback in the host's rotation state
+      ansible.builtin.include_tasks: state_write.yml
+      vars:
+        ssh_key_rotation_state:
+          stage: verify-rolled-back
+
+    # Exact-restore mode only: the new key comes out again at the very end, and only once the old key
+    # has been proven to work. Until then it stays, so the host never depends solely on a key that a
+    # previous make_exclusive, a passphrase or a crypto policy might have made unusable.
+    - name: Rollback | Check the old key works before the new key is removed again
+      when:
+        - ssh_key_rotation_rollback_remove_new_key | bool
+        - ssh_key_rotation_rollback_ak_done | bool
+        - old_private_key is defined
+      ansible.builtin.include_tasks: probe_key.yml
+      vars:
+        ssh_key_rotation_probe_key: "{{ old_private_key }}"
+        ssh_key_rotation_probe_label: old key
+        ssh_key_rotation_probe_required: false
+
+    # Only once the old key is back. If the policy change is what made the new key usable and
+    # authorized_keys could NOT be restored, reverting the policy would leave the host with only a
+    # key the old policy may reject. The final probe below re-proves the old key under the restored
+    # policy, and the policy is re-applied if it fails.
+    - name: Rollback | Put back the crypto policy this run replaced
+      when: ssh_key_rotation_rollback_ak_done | bool
+      ansible.builtin.include_tasks: crypto_policy_restore.yml
+
     # The final proof, and deliberately NOT ansible.builtin.ping. Ansible's ControlPath is keyed on
     # host/port/user, not on the identity file, so a ping can succeed over a socket opened with a
     # different credential and report access that no longer exists. probe_key.yml drives a real ssh
@@ -495,8 +519,7 @@
         ssh_key_rotation_rollback_probe_key: >-
           {{ old_private_key
              if (old_private_key is defined
-                 and ssh_key_rotation_rollback_ak_restored is defined
-                 and ssh_key_rotation_rollback_ak_restored is changed)
+                 and ssh_key_rotation_rollback_ak_done | bool)
              else (new_private_key if new_private_key is defined
                    else (old_private_key if old_private_key is defined else '')) }}
 
@@ -508,6 +531,21 @@
         ssh_key_rotation_probe_label: restored credential
         ssh_key_rotation_probe_required: false
 
+    - name: Rollback | Re-apply this run's crypto policy because no credential works under the restored one
+      when:
+        - ssh_key_rotation_crypto_policy_restored is defined and ssh_key_rotation_crypto_policy_restored is changed
+        - ssh_key_rotation_rollback_probe_key | length > 0
+        - ssh_key_rotation_probe_result is not defined or ssh_key_rotation_probe_result.rc != 0
+      ansible.builtin.command:
+        argv:
+          - update-crypto-policies
+          - --set
+          - "{{ ssh_key_rotation_crypto_policy_record.applied | default('') }}"
+      become: true
+      changed_when: ssh_key_rotation_crypto_policy_reapplied.rc == 0
+      failed_when: false
+      register: ssh_key_rotation_crypto_policy_reapplied
+
     - name: Rollback | Warn when no private key was available to prove access with
       when: ssh_key_rotation_rollback_probe_key | length == 0
       ansible.builtin.debug:
@@ -516,11 +554,24 @@
           after the rollback. The configuration changes were undone, but verify by hand that you can
           still log in to this host before closing your session.
 
-    - name: Rollback | Record the rollback in the host's rotation state
-      ansible.builtin.include_tasks: state_write.yml
+    # The last thing this rescue does on the host, because it removes the key this play is connected
+    # with. Pipelined, so the module runs inside a single SSH session with no temporary-file cleanup
+    # connection afterwards - which the host would now refuse. Only the controller-side fail follows.
+    - name: Rollback | Remove the new key again now the old key is proven (exact-restore mode)
+      when:
+        - ssh_key_rotation_rollback_remove_new_key | bool
+        - ssh_key_rotation_rollback_ak_done | bool
+        - ssh_key_rotation_probe_result is defined and ssh_key_rotation_probe_result.rc == 0
+        - new_public_key_file is defined
       vars:
-        ssh_key_rotation_state:
-          stage: verify-rolled-back
+        ansible_pipelining: true
+      ansible.posix.authorized_key:
+        user: "{{ ssh_key_rotation_target_user }}"
+        key: "{{ lookup('file', new_public_key_file, errors='ignore') | default('', true) }}"
+        state: absent
+      become: true
+      failed_when: false
+      register: ssh_key_rotation_rollback_new_key_removed
 
     - name: Rollback | Fail with details of what was automatically undone
       ansible.builtin.fail:
@@ -539,14 +590,21 @@
           {{ ("This role's drop-ins were removed, so its configuration changes are fully undone.")
              if (ssh_key_rotation_recorded.dropins is defined) else
              ('sshd_config was restored from ' ~ (ssh_key_rotation_sshd_config_backup.dest | default('n/a', true))) }}
+          {{ ('' if not (ssh_key_rotation_crypto_policy_restored is defined and ssh_key_rotation_crypto_policy_restored is changed)
+              else ('The crypto policy was put back to "' ~ (ssh_key_rotation_crypto_policy_record.before | default('?')) ~ '".')
+              if (ssh_key_rotation_crypto_policy_reapplied is not defined or ssh_key_rotation_crypto_policy_reapplied is skipped)
+              else ('The crypto policy was put back, but no credential authenticated under it, so this run'
+                    ~ "'s policy (" ~ (ssh_key_rotation_crypto_policy_record.applied | default('?')) ~ ') was re-applied.')) }}
           {{ ('authorized_keys was restored, so the old key works again; the new key was deliberately'
               ~ ' left alongside it, since removing it would leave the host depending solely on the'
               ~ ' old key. Set ssh_key_rotation_rollback_remove_new_key=true for the exact pre-install file.')
-             if (ssh_key_rotation_rollback_ak_restored is defined
-                 and ssh_key_rotation_rollback_ak_restored is changed
+             if (ssh_key_rotation_rollback_ak_done | bool
                  and not (ssh_key_rotation_rollback_remove_new_key | bool))
              else ('authorized_keys was restored to its exact pre-install contents; the new key is no longer installed.'
-                   if (ssh_key_rotation_rollback_ak_restored is defined and ssh_key_rotation_rollback_ak_restored is changed)
+                   if (ssh_key_rotation_rollback_new_key_removed is defined and ssh_key_rotation_rollback_new_key_removed is changed)
+                   else ('authorized_keys was restored, so the old key works again, but the new key was KEPT alongside'
+                         ~ ' it: the old key could not be proven to work on a fresh connection, or removing the new key failed.')
+                   if (ssh_key_rotation_rollback_ak_done | bool)
                    else 'authorized_keys was NOT restored - no pre-install backup was recorded, or the old key could not be proven to work - so the new key was left in place as the only usable credential.') }}
           {{ ('WARNING: sshd could not be reloaded during the rollback ('
               ~ (ssh_key_rotation_rollback_reload.msg | default('unknown error'))

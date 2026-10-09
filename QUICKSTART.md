@@ -20,7 +20,10 @@ ssh-keygen -t ed25519 -f ./pwc_id_ed25519 -C "your-email@example.com"
 ```
 
 On a RHEL-family host in FIPS mode, use `-t ecdsa -b 521` instead: the FIPS crypto-policy does
-not accept ed25519 keys. The playbook checks this for you and stops safely if it is wrong.
+not accept ed25519 keys. The playbook checks this for you and stops safely if it is wrong. On an
+AlmaLinux or Rocky Linux host in FIPS mode it also stops until you set
+`ssh_key_rotation_accept_fips_validation_gap: true`, since FIPS mode there is not FIPS 140-3
+validation; see [PQC.md](PQC.md#fips-mode-is-not-fips-validation).
 
 ## 3. List your hosts
 
@@ -98,7 +101,8 @@ Nothing below leaves a host half-changed. The playbook either completes or puts 
 |---------|---------------|
 | `Missing required variables` | One of the four paths is unset. Nothing has run yet. |
 | `does not match new_public_key_file` | Your new private and public keys are not a pair. Check both paths. |
-| `crypto-policy would reject the new key entirely` | The host will not accept this key type, commonly ed25519 under FIPS. Generate an ECDSA or RSA key. Stopped before touching anything. |
+| `FIPS validation gap` | An AlmaLinux or Rocky Linux host is in FIPS mode, but its community packages are not FIPS 140-3 validated. Set `ssh_key_rotation_accept_fips_validation_gap: true` if that is acceptable. Stopped before touching anything. |
+| `crypto-policy would reject the new key entirely` | The host will not accept this key type, commonly ed25519 under FIPS. Generate an ECDSA or RSA key. Changes were rolled back. |
 | `New key did not authenticate` | The new key could not log in, so the old key was left alone. Check it reached `authorized_keys`. |
 | `still reports password authentication as ENABLED` | A file in `/etc/ssh/sshd_config.d/` is overriding the lock-down. Fix it there, or set `ssh_key_rotation_manage_sshd_dropin: true`, and re-run. Changes were rolled back. |
 | `STILL ENABLED for <user>` | A `Match` block re-enables password login for the account you rotated. The role never edits `Match` blocks; amend it by hand and re-run. Changes were rolled back. |

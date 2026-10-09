@@ -1,5 +1,33 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- A crypto-policy change could lock every modern client out of a FIPS-mode host: on AlmaLinux 10.1, `TEST-PQ` made sshd advertise ML-KEM and then reject it, and because `update-crypto-policies` restarts sshd, no rollback could run. The desired policy is now rendered and checked before anything is applied. See [FIPS-mode hosts](PQC.md#fips-mode-hosts).
+- All crypto-policy checks now run before the install stage changes anything, so a stop leaves the host exactly as it was found. A missing module used to be caught only after the new key and drop-in were written.
+- Rollbacks now put back a crypto-policy the run changed. The docs already said so; the code never did. Only a change made by the same run is undone, and only if nobody has changed the policy since. In the verify stage this happens once the old key is back, and the run's policy is re-applied if no key works under the old one.
+- A failed run could undo an earlier successful run's work: drop-in and crypto-policy records left in the state file were acted on by the next run's rollback. The install stage now clears them when it starts.
+- The verify-stage rollback could die half way without SSH multiplexing: it restored an `authorized_keys` without the new key the play was connected with, so the next connection was refused and nothing after it ran. It is now one write containing both keys; in `ssh_key_rotation_rollback_remove_new_key` mode the new key is removed last, once the old key is proven.
+
+### Changed
+
+- Every rotation, PQC or not, now stops on an AlmaLinux or Rocky Linux host in FIPS mode until `ssh_key_rotation_accept_fips_validation_gap: true` is set.
+- A requested PQC algorithm that never takes effect now fails the install stage and rolls back. It used to warn and then complete with every connection silently falling back to a classical algorithm, which on RHEL-family hosts is what happens when algorithms are requested without managing the crypto-policy. Set `ssh_key_rotation_pqc_require_effective: false` for the old behaviour.
+- Before removing the old key, the verify stage proves the requested key exchange is really negotiated, on a fresh connection that offers only those algorithms.
+- Corrected docs: AlmaLinux 10.1's `FIPS` policy has no SSH post-quantum key exchange; EL10 has no `PQ` module because its base policies already enable ML-KEM; RHEL 10.2 adds NIST-curve ML-KEM hybrids for OpenSSH in FIPS mode and makes `FUTURE` ML-KEM-only; OpenSSH 10.6 ships a post-quantum signature algorithm.
+
+### Added
+
+- Stops, each with an override, for conflicts found before any change:
+  - FIPS mode on AlmaLinux or Rocky Linux, whose community packages are not FIPS 140-3 validated: `ssh_key_rotation_accept_fips_validation_gap`. See [FIPS mode is not FIPS validation](PQC.md#fips-mode-is-not-fips-validation).
+  - Algorithms or a policy outside a FIPS-mode host's `FIPS` policy: `ssh_key_rotation_allow_non_fips_algorithms`.
+  - A policy leaving only post-quantum key exchange, such as RHEL 10.2's `FUTURE`, which cuts off every client without PQC support: `ssh_key_rotation_allow_pqc_only_kex`.
+  - A policy this playbook's own ssh client could no longer connect under: no override, since the run would lock itself out. See [Policies that cut clients off](PQC.md#policies-that-cut-clients-off).
+- `ssh_key_rotation_pqc_require_effective` (default `true`).
+- `extensions/vhs/`: live PQC test scenarios against real VMs, run from podman control nodes, a VHS tape that replays and records them, `pqc_matrix.sh`, which runs them all plus negative proofs unattended, and `scenario_frames.sh`, which saves each scenario's final screen from the recording. Not included in the collection build.
+- README: FIPS and PQC at a glance table, what works and what the role refuses, per platform.
+
 ## [0.9.1] - 2026-08-13
 
 Added role README.md to satiffy galaxy collection requirements

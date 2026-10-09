@@ -83,9 +83,9 @@ The collection targets Debian/Ubuntu and RHEL/Fedora-family hosts generally. The
 |----|-------|
 | Ubuntu 22.04 LTS (Jammy Jellyfish) | Watch for `sshd_config.d/` drop-ins such as cloud-init's `50-cloud-init.conf`, which can override settings written further down `sshd_config`. See [Drop-in sshd config files found](#drop-in-sshd-config-files-found). |
 | Ubuntu 26.04 LTS, OpenSSH 10.2 | Ships `50-cloud-init.conf` with `PasswordAuthentication yes`, which overrides the lock-down. Phase 2 fails rather than reporting a success it did not achieve. Fix the drop-in and re-run. |
-| Rocky Linux 9.8 (Blue Onyx), `FIPS` crypto-policy | `FIPS` excludes `ssh-ed25519`, so ed25519 keys are rejected. Use ECDSA or RSA. `FIPS` alone has no PQC key exchange; add it with `ssh_key_rotation_crypto_policy_add_modules: [PQ]`. |
-| AlmaLinux 9.8 (Olive Jaguar), `FIPS` crypto-policy | `FIPS` on its own has no PQC key exchange. Use `ssh_key_rotation_crypto_policy_add_modules: [PQ]` to add it. See [Combining a base policy with a subpolicy module](PQC.md#combining-a-base-policy-with-a-subpolicy-module). |
-| AlmaLinux 10.1 / 10.2 (Lavender Lion), `FIPS` crypto-policy | `FIPS` already includes PQC key exchange here. No extra module needed. As on 9.x, ed25519 is not accepted under FIPS. |
+| Rocky Linux 9.8 (Blue Onyx), kernel not in FIPS mode | Under the `FIPS` crypto-policy, `ssh-ed25519` is excluded, so use ECDSA or RSA keys. `DEFAULT` has no SSH post-quantum key exchange; `ssh_key_rotation_crypto_policy_add_modules: [PQ]` (RHEL 9.7+) gives `DEFAULT:PQ`, and `mlkem768x25519-sha256` was negotiated end to end. |
+| AlmaLinux 9.8 (Olive Jaguar), `FIPS` crypto-policy | `FIPS` on its own has no PQC key exchange. With the kernel not in FIPS mode, `ssh_key_rotation_crypto_policy_add_modules: [PQ]` adds it. On a FIPS-mode kernel the role refuses this, see [FIPS-mode hosts](PQC.md#fips-mode-hosts). |
+| AlmaLinux 10.1 (Heliotrope Lion), `FIPS` crypto-policy, kernel in FIPS mode (`fips_enabled=1`) | No PQC key exchange for SSH: the `FIPS` policy deliberately removes `mlkem768x25519-sha256` from OpenSSH, and sshd rejects it in FIPS mode. Ships `TEST-PQ` and `NO-PQ` modules but no `PQ`. Adding `TEST-PQ` locks every OpenSSH 9.9+ client out, so the role refuses it before changing anything. ed25519 is not accepted under FIPS. FIPS mode here is not FIPS 140-3 validation: no AlmaLinux 10.x module is validated, so the role stops unless `ssh_key_rotation_accept_fips_validation_gap: true`. See [FIPS mode is not FIPS validation](PQC.md#fips-mode-is-not-fips-validation). |
 | openSUSE Leap 15.6 | Ships Python 3.6 by default, which is too old for Ansible 2.15+ on the target side. Set `ansible_python_interpreter` to a Python 3.7+ install, for example `python39` via `zypper`. |
 
 Container-based tests (`molecule`) additionally cover Ubuntu 22.04, Rocky Linux 9 and Rocky Linux 10,
@@ -202,7 +202,7 @@ host is touched. Copy `rotation_vars.example.yml` instead.
 
 ### Optional, post-quantum
 
-All of these are empty or false by default, so none of them change existing behaviour unless you ask for them. See [PQC.md](PQC.md).
+The algorithm lists are empty and policy management is off by default. One stop applies to every rotation, PQC or not: an AlmaLinux or Rocky Linux host in FIPS mode stops unless `ssh_key_rotation_accept_fips_validation_gap: true`. See [PQC.md](PQC.md).
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
@@ -212,6 +212,10 @@ All of these are empty or false by default, so none of them change existing beha
 | `ssh_key_rotation_manage_crypto_policy` | bool | `false` | Manage the RHEL/Fedora system-wide crypto-policy on the control node and targets |
 | `ssh_key_rotation_crypto_policy_setting` | string | `DEFAULT:PQ` | Value passed to `update-crypto-policies --set` |
 | `ssh_key_rotation_crypto_policy_add_modules` | list | `[]` | Adds modules such as `PQ` onto whatever policy a host already has, instead of replacing it |
+| `ssh_key_rotation_pqc_require_effective` | bool | `true` | Fail and roll back if a requested PQC algorithm is not in sshd's effective config, and prove the requested key exchange is negotiated before the old key is removed. `false` accepts a silent classical fallback |
+| `ssh_key_rotation_accept_fips_validation_gap` | bool | `false` | Proceed on an AlmaLinux or Rocky Linux host in FIPS mode, whose community packages are not FIPS 140-3 validated. See [PQC.md](PQC.md#fips-mode-is-not-fips-validation) |
+| `ssh_key_rotation_allow_non_fips_algorithms` | bool | `false` | On a FIPS-mode kernel, allow algorithms or a crypto-policy outside the host's `FIPS` policy. These lock clients out; use only with console access |
+| `ssh_key_rotation_allow_pqc_only_kex` | bool | `false` | Allow a crypto-policy that leaves only post-quantum key exchange, such as RHEL 10.2's `FUTURE`, cutting off clients without PQC support |
 
 ## Key validation
 
@@ -225,9 +229,9 @@ Before any host is touched, Phase 0 runs on the control node and checks that:
 
 ### A note on post-quantum keys
 
-Mainline OpenSSH does not yet ship a post-quantum *signature* algorithm for `authorized_keys` or host keys. It only ships post-quantum *key exchange* for the transport layer, namely `mlkem768x25519-sha256` and `sntrup761x25519-sha512`. See [openssh.org/pq.html](https://www.openssh.org/pq.html).
+Until recently, mainline OpenSSH shipped only post-quantum *key exchange* for the transport layer, namely `mlkem768x25519-sha256` and `sntrup761x25519-sha512`. OpenSSH 10.4 (July 2026) added an experimental hybrid post-quantum *signature* algorithm, ML-DSA-44 combined with Ed25519, and OpenSSH 10.6 (October 2026) enabled it by default as `ssh-mldsa44-ed25519`. Keys made with the experimental 10.4 version must be regenerated. See [openssh.org/pq.html](https://www.openssh.org/pq.html) and the [release notes](https://www.openssh.org/releasenotes.html).
 
-So there is no standard "PQC key" to check for yet. `ssh_key_rotation_pqc_key_types` exists as a forward-compatible allowlist. Once OpenSSH, or an [OQS-OpenSSH](https://github.com/open-quantum-safe/openssh) build, reports a PQC signature type such as `MLDSA65` or `FALCON1024` from `ssh-keygen -l`, add that name to `ssh_key_rotation_pqc_key_types` and it will be accepted. No other change is needed.
+Most hosts and control nodes still run OpenSSH older than 10.6, and this collection has not been tested with ML-DSA keys. `ssh_key_rotation_pqc_key_types` exists as a forward-compatible allowlist. Once OpenSSH, or an [OQS-OpenSSH](https://github.com/open-quantum-safe/openssh) build, reports a PQC signature type such as `MLDSA65` or `FALCON1024` from `ssh-keygen -l`, add that name to `ssh_key_rotation_pqc_key_types` and it will be accepted. No other change is needed.
 
 ### The Phase 1 algorithm check
 
@@ -245,6 +249,30 @@ and the control node's own ssh client.
 
 If you need it, it is all on one page: **[PQC.md](PQC.md)**. It covers the variables, where each
 piece runs across the three phases, and how `FIPS:PQ`-style crypto-policy modules work.
+
+### FIPS and PQC at a glance
+
+Post-quantum *key exchange* for SSH, by platform. "Refused" means the role stops before changing
+anything. On any AlmaLinux or Rocky Linux host in FIPS mode, every run also stops first on the
+[FIPS validation gap](PQC.md#fips-mode-is-not-fips-validation) unless
+`ssh_key_rotation_accept_fips_validation_gap: true`.
+
+| Platform | FIPS mode | You ask for | Result | Tested |
+|----------|-----------|-------------|--------|--------|
+| Ubuntu 26.04, OpenSSH 10.2 | No | `pqc_kex_algorithms: [mlkem768x25519-sha256]` | Works; offered by default | Yes |
+| Ubuntu 26.04 | No | The same, with an admin drop-in overriding `KexAlgorithms` | Fails and rolls back; no silent classical fallback | Yes |
+| Rocky 9.8, `DEFAULT` policy | No | `crypto_policy_add_modules: [PQ]` (RHEL 9.7+) | Works; `DEFAULT:PQ`, ML-KEM negotiated | Yes |
+| Rocky 9.8 | No | `[PQ]` plus `sntrup761x25519-sha512`, which `PQ` does not enable | Fails and rolls back, policy restored | Yes |
+| AlmaLinux 9.8, `FIPS` policy | No | `[PQ]` | Works; `FIPS:PQ` puts ML-KEM in sshd's effective config | Yes |
+| EL9 or EL10 | Yes | `FIPS:PQ`, `FIPS:TEST-PQ`, or `mlkem768x25519-sha256` | Refused: sshd advertises it, then rejects it in FIPS mode, locking clients out | Yes, AlmaLinux 10.1 |
+| AlmaLinux 10.1 | Yes | `DEFAULT` or `DEFAULT:PQ` | Refused: leaves the `FIPS` policy (and EL10 has no `PQ` module) | Yes |
+| AlmaLinux 10.1 | Yes | `FIPS:NO-PQ` | Works; modules that only remove algorithms are allowed | Yes |
+| EL10 | No | `pqc_kex_algorithms: [mlkem768x25519-sha256]`, no module | Expected to work: EL10 base policies already enable ML-KEM | No |
+| RHEL 10.2 | Yes | `mlkem768nistp256-sha256` or `mlkem1024nistp384-sha384` | Allowed (in 10.2's `FIPS` policy); the control node's OpenSSH must offer them | No |
+| RHEL 10.2 `FUTURE`, or any ML-KEM-only policy | No | That policy | Refused, as clients without PQC are cut off; `allow_pqc_only_kex: true` overrides | Yes, stand-in module on Rocky 9.8 |
+| Any | Any | A policy the control node's own `ssh` could not connect to | Refused, no override | Yes, OpenSSH 9.6 control node |
+
+Variable names drop the `ssh_key_rotation_` prefix. Full detail in [PQC.md](PQC.md).
 
 Note that `ssh_key_rotation_pqc_key_types` only affects local key *type* recognition in Phase 0.
 It does not change what `sshd` and `ssh` actually negotiate on the wire; that needs the algorithm
@@ -433,7 +461,7 @@ A reload that itself fails does not abort the rollback. The restored files are a
 6. If requested, append PQC or hybrid algorithms to `sshd_config` and apply a RHEL/Fedora crypto-policy.
 7. Look for drop-in config files and `Match` blocks that might quietly override what was just set.
 8. Apply the sshd configuration changes.
-9. Read the effective `PubkeyAcceptedAlgorithms` and `KexAlgorithms` from `sshd -T`, and fail the host if the new key's real signature algorithm is not among them. Any requested PQC algorithm that is still missing produces an informational warning.
+9. Read the effective `PubkeyAcceptedAlgorithms` and `KexAlgorithms` from `sshd -T`, and fail the host if the new key's real signature algorithm is not among them. Any requested PQC algorithm that is still missing fails the host and rolls back, unless `ssh_key_rotation_pqc_require_effective` is `false`.
 
 ### Phase 2: verify and clean up
 
@@ -461,7 +489,9 @@ All the logic lives in the `ssh_key_rotation` role, under `roles/ssh_key_rotatio
 | `tasks/validate.yml` | Phase 0: local pre-flight validation, no remote connections |
 | `tasks/install.yml` | Phase 1: connect with the old key, install the new key, prepare sshd |
 | `tasks/verify.yml` | Phase 2: reconnect with the new key to prove it works, then remove the old key and legacy auth |
-| `tasks/manage_crypto_policy.yml` | RHEL/Fedora crypto-policy management, included by both the validate and install stages |
+| `tasks/crypto_policy_plan.yml` | Read-only crypto-policy and FIPS checks, run before any change on the control node and each target |
+| `tasks/manage_crypto_policy.yml` | Applies the planned crypto-policy, recording it so a rollback can restore it |
+| `tasks/crypto_policy_restore.yml` | Puts back a crypto-policy this run changed, from the install and verify rollbacks |
 | `meta/main.yml` | Role metadata: supported platforms, minimum Ansible version |
 
 There is deliberately no `tasks/main.yml` entry point, because each stage authenticates differently. Validate runs locally, install uses the old key, and verify uses the new key. The role must be included with an explicit `tasks_from`.
@@ -509,10 +539,15 @@ and could still apply to a future login.
 already have. If one at its own path already exists it is backed up and restored rather than
 deleted. See [Drop-in overrides](#drop-in-overrides).
 
-**Crypto-policy changes are not rolled back byte-for-byte.** `update-crypto-policies --set`
-regenerates `/etc/crypto-policies/back-ends/*`, so restoring the previous policy *name* does not
-restore files an administrator hand-edited underneath it. The control node's own policy, if
-`ssh_key_rotation_manage_crypto_policy` changed it, is not restored at all.
+**Crypto-policy changes are not rolled back byte-for-byte.** On success the new policy stays. A
+rollback puts the previous policy *name* back, but only if this run changed it and nobody has changed
+it since. The install stage starts by clearing the previous run's record, so a later run's install
+stage never reverts an earlier run's policy. A verify stage run on its own acts on the last install's
+record, as it does for that install's other changes.
+`update-crypto-policies --set` regenerates `/etc/crypto-policies/back-ends/*`, so restoring the name
+does not restore files an administrator hand-edited underneath it. In the verify stage the policy is
+only put back once the old key is back, and is re-applied if no credential works under it. The
+control node's own policy, if `ssh_key_rotation_manage_crypto_policy` changed it, is not restored at all.
 
 **The state file is left on the host** at `/etc/ansible/facts.d/ssh_key_rotation.fact`, deliberately.
 It records what the last run changed, which is what makes a later recovery possible once the
@@ -616,12 +651,13 @@ would restore from.
 
 ### PQC algorithms not negotiating
 
-If Phase 1's post-reload check warns that `sshd -T` does not mention a requested PQC algorithm, or Phase 2 fails to authenticate with a PQC-type key, work through these in order:
+If Phase 1 fails because `sshd -T` does not list a requested PQC algorithm, or Phase 2's probe that offers only the requested key exchange fails, work through these in order:
 
 1. Confirm the control node's ssh binary supports the algorithms you asked for. Phase 0 already checks this, but `ssh -Q kex` and `ssh -Q key-sig` will tell you directly.
 2. Confirm the target's sshd build supports them too: `sshd -T | grep -i kexalgorithms`.
 3. If `ssh_key_rotation_manage_crypto_policy` is set on a RHEL or Fedora host, check the policy actually changed: `update-crypto-policies --show`.
-4. Look for a `50-redhat.conf` or other drop-in overriding your settings.
+4. Look for a `40-redhat-crypto-policies.conf`, `50-redhat.conf` or other drop-in overriding your settings. On RHEL-family hosts the crypto-policy include is read before this role's drop-in, so algorithms have to come from the policy.
+5. If the host is in FIPS mode (`cat /proc/sys/crypto/fips_enabled`), see [FIPS-mode hosts](PQC.md#fips-mode-hosts).
 
 ### "Desired crypto policy ... needs module(s) ... that were not found"
 

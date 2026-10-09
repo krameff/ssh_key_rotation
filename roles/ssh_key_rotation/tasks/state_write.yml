@@ -21,6 +21,10 @@
 #
 # Callers pass ssh_key_rotation_state (a dict). Anything not passed is preserved from the existing
 # fact, so install can record its half and verify can add to it without either clobbering the other.
+# Callers may also pass ssh_key_rotation_state_reset, a list of top-level keys to DROP from the
+# existing fact first. A recursive merge can never remove a key, so without this a record left by an
+# earlier, successful run would still be there for this run's rollback to act on - deleting a
+# drop-in or reverting a crypto policy that run had set on purpose.
 
 - name: State | Ensure the local facts directory exists
   ansible.builtin.file:
@@ -54,7 +58,10 @@
              and (ssh_key_rotation_state_existing.content | b64decode | trim).startswith('{'))
          else {} }}
   ansible.builtin.set_fact:
-    ssh_key_rotation_state_merged: "{{ ssh_key_rotation_state_prior | combine(ssh_key_rotation_state, recursive=True) }}"
+    ssh_key_rotation_state_merged: >-
+      {{ ssh_key_rotation_state_prior
+         | dict2items | rejectattr('key', 'in', ssh_key_rotation_state_reset | default([])) | items2dict
+         | combine(ssh_key_rotation_state, recursive=True) }}
 
 - name: State | Write the rotation state fact
   ansible.builtin.copy:

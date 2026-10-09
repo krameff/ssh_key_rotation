@@ -1,0 +1,50 @@
+---
+
+# Puts back the crypto policy this run changed, for the install and verify rollbacks.
+#
+# Runs inside a rescue:, where an undefined variable or a failing task aborts the rescue and cancels
+# the rest of the rollback, so every lookup is guarded and neither command can fail.
+#
+# The install stage clears the record when it starts, so a record here always describes a change made
+# by the current run. It is only undone while the policy is still the one this run applied: if
+# someone has changed it since, theirs is the newer intent and it is left alone, with a warning.
+#
+# Callers must have run state_read.yml first. Sets ssh_key_rotation_crypto_policy_restored, which is
+# changed only if the policy was actually put back.
+
+- name: Crypto policy restore | Work out whether this run changed the crypto policy
+  ansible.builtin.set_fact:
+    ssh_key_rotation_crypto_policy_record: "{{ (ssh_key_rotation_recorded | default({})).crypto_policy | default({}, true) }}"
+
+- name: Crypto policy restore | Check the current crypto policy
+  when: ssh_key_rotation_crypto_policy_record.applied is defined
+  ansible.builtin.command: update-crypto-policies --show
+  changed_when: false
+  failed_when: false
+  register: ssh_key_rotation_crypto_policy_now
+
+- name: Crypto policy restore | Put back the crypto policy this run replaced
+  when:
+    - ssh_key_rotation_crypto_policy_now.rc | default(1) == 0
+    - ssh_key_rotation_crypto_policy_now.stdout | trim == ssh_key_rotation_crypto_policy_record.applied | default('')
+  ansible.builtin.command:
+    argv: [update-crypto-policies, --set, "{{ ssh_key_rotation_crypto_policy_record.before | default('') }}"]
+  become: true
+  changed_when: ssh_key_rotation_crypto_policy_restored.rc == 0
+  failed_when: false
+  register: ssh_key_rotation_crypto_policy_restored
+
+- name: Crypto policy restore | Warn if the crypto policy could not be put back
+  when:
+    - ssh_key_rotation_crypto_policy_record.applied is defined
+    - ssh_key_rotation_crypto_policy_restored is not changed
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: this run changed the crypto policy from
+      "{{ ssh_key_rotation_crypto_policy_record.before | default('?') }}" to
+      "{{ ssh_key_rotation_crypto_policy_record.applied }}", but it was NOT put back. It is now
+      "{{ ssh_key_rotation_crypto_policy_now.stdout | default('(unknown)') | trim }}"
+      {{ ('- update-crypto-policies --set failed: ' ~ (ssh_key_rotation_crypto_policy_restored.stderr | default('') | trim))
+         if ssh_key_rotation_crypto_policy_restored is not skipped
+         else ('- changed by something else since, so it is left alone.' if ssh_key_rotation_crypto_policy_now.rc | default(1) == 0
+               else '- the current policy could not be read.') }}

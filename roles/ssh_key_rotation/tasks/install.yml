@@ -11,6 +11,17 @@
   ansible.builtin.set_fact:
     ssh_key_rotation_new_key_type: "{{ ssh_key_rotation_new_key_info.stdout | regex_search('\\(([^)]+)\\)\\s*$') | regex_replace('[()]', '') }}"
 
+# Read-only, and deliberately before ANY change to the host - before the authorized_keys backup and
+# the state file, not just before the block. A refusal here (FIPS lockout, missing module) leaves
+# the host exactly as it was found, with nothing for a later standalone verify or break-glass run
+# to misread. See crypto_policy_plan.yml for why these checks cannot wait until after the apply.
+- name: Install | Plan this host's crypto-policy change and refuse anything that would lock clients out
+  ansible.builtin.include_tasks: crypto_policy_plan.yml
+  vars:
+    ssh_key_rotation_crypto_policy_context: "this host"
+    ssh_key_rotation_crypto_policy_no_tool_followup: "Only this role's sshd drop-in will carry the requested algorithms."
+    ssh_key_rotation_crypto_policy_on_target: true
+
 - name: Install | Resolve the target user's primary group
   ansible.builtin.include_tasks: resolve_target_identity.yml
 
@@ -48,6 +59,9 @@
 - name: Install | Record the pre-install state on the host
   ansible.builtin.include_tasks: state_write.yml
   vars:
+    # Records describe THIS run only. Left over from an earlier successful run, they would have this
+    # run's rollback delete that run's drop-in or revert the crypto policy it set on purpose.
+    ssh_key_rotation_state_reset: [dropins, crypto_policy]
     ssh_key_rotation_state:
       run_id: "{{ ansible_facts.date_time.iso8601_basic_short }}"
       stage: install-started
@@ -132,24 +146,22 @@
       become: true
       notify: Reload sshd
 
-    # Same opt-in crypto-policy handling as the validate stage's control-node block, detected via the tool rather than ansible_os_family.
-    # Shared with validate.yml's control-node equivalent; see tasks/manage_crypto_policy.yml.
+    # Applies what crypto_policy_plan.yml approved above, recording it first so the rescue below can
+    # put the previous policy back. Shared with validate.yml's control-node equivalent.
     - name: Install | Manage this host's system-wide crypto policy
       ansible.builtin.include_tasks: manage_crypto_policy.yml
       vars:
         ssh_key_rotation_crypto_policy_context: "this host"
-        ssh_key_rotation_crypto_policy_no_tool_followup: "Falling back to the direct sshd_config algorithm edits above only."
+        ssh_key_rotation_crypto_policy_record_state: true
 
-    # update-crypto-policies only validates its own syntax, not the merged sshd_config, so re-validate here before the reload handler fires.
-    - name: Install | Validate sshd_config after crypto-policy check/apply
-      when:
-        - ssh_key_rotation_manage_crypto_policy | bool
-        - ssh_key_rotation_crypto_policies_tool.rc == 0
+    # update-crypto-policies only validates its own syntax, not the merged sshd_config. It has already
+    # restarted sshd by this point, so a failure here rolls back (and restores the policy) rather
+    # than preventing anything; it still catches a merged config sshd would refuse at its next restart.
+    - name: Install | Validate sshd_config after the crypto-policy change
+      when: ssh_key_rotation_crypto_policy_change | bool
       ansible.builtin.command: sshd -t
       become: true
       changed_when: false
-      register: ssh_key_rotation_sshd_validate_after_crypto_policy
-      failed_when: ssh_key_rotation_sshd_validate_after_crypto_policy.rc != 0
 
     # A drop-in (e.g. /etc/ssh/sshd_config.d/50-cloud-init.conf) can override the main file - if your hosts use drop-ins, write these settings there instead.
     - name: Install | Detect any sshd_config drop-in files that could override settings
@@ -269,14 +281,38 @@
           {{ (ssh_key_rotation_pqc_kex_algorithms | difference(ssh_key_rotation_effective_kex_algorithms))
              + (ssh_key_rotation_pqc_pubkey_algorithms | difference(ssh_key_rotation_effective_pubkey_algorithms)) }}
 
-    - name: Install | Warn if sshd's effective config doesn't appear to include the requested PQC algorithms
+    # A hard failure by default, not a warning. The `+` syntax keeps classical fallbacks, so a
+    # requested algorithm that never took effect does not break anything - the rotation used to
+    # complete and report success with no post-quantum algorithm in use at all. On RHEL-family hosts
+    # that is the normal outcome of a drop-in alone: 40-redhat-crypto-policies.conf is read first and
+    # sshd keeps the first value it sees. Unreadable `sshd -T` fails too: unknown is not "in effect".
+    - name: Install | Fail if the requested PQC algorithms are not in sshd's effective config
       when:
-        - ssh_key_rotation_missing_pqc_algorithms is defined
-        - ssh_key_rotation_missing_pqc_algorithms | length > 0
+        - ssh_key_rotation_pqc_require_effective | bool
+        - (ssh_key_rotation_pqc_kex_algorithms + ssh_key_rotation_pqc_pubkey_algorithms) | length > 0
+      ansible.builtin.assert:
+        that:
+          - ssh_key_rotation_sshd_effective_config.rc == 0
+          - ssh_key_rotation_missing_pqc_algorithms | default([]) | length == 0
+        fail_msg: >-
+          {{ ('sshd -T on this host does not list ' ~ (ssh_key_rotation_missing_pqc_algorithms | default([]) | string)
+              ~ ', so they are not in effect and every connection would silently fall back to a classical'
+              ~ ' algorithm. On RHEL-family hosts the crypto-policy include is read before this role'
+              ~ "'s drop-in; enable them through the policy (ssh_key_rotation_manage_crypto_policy) instead.")
+             if ssh_key_rotation_sshd_effective_config.rc == 0
+             else ('sshd -T failed on this host (' ~ (ssh_key_rotation_sshd_effective_config.stderr | default('') | trim)
+                   ~ '), so the requested PQC algorithms could not be confirmed in effect.') }}
+          Rolling back. Set ssh_key_rotation_pqc_require_effective=false to accept a classical fallback.
+        success_msg: "All requested PQC algorithms are in sshd's effective config."
+
+    - name: Install | Warn if the requested PQC algorithms are not in sshd's effective config
+      when:
+        - not (ssh_key_rotation_pqc_require_effective | bool)
+        - ssh_key_rotation_missing_pqc_algorithms | default([]) | length > 0
       ansible.builtin.debug:
         msg: >-
           sshd -T on this host does not list: {{ ssh_key_rotation_missing_pqc_algorithms }}.
-          The verify stage may fail to negotiate these; review sshd_config/crypto-policy before proceeding.
+          Connections will fall back to classical algorithms (ssh_key_rotation_pqc_require_effective=false).
 
   rescue:
     - name: Install rollback | Re-read the recorded state so it includes this stage's own changes
@@ -315,6 +351,11 @@
         validate: 'sshd -t -f %s'
       become: true
       register: ssh_key_rotation_install_rb_block
+
+    # The old key never left during this stage, so the policy it was working under can go straight
+    # back. update-crypto-policies restarts sshd itself, so no reload is needed for it.
+    - name: Install rollback | Put back the crypto policy this run replaced
+      ansible.builtin.include_tasks: crypto_policy_restore.yml
 
     # `.dest is defined`, not `is succeeded`: a SKIPPED result also satisfies `is succeeded`, and
     # referencing .dest on one raises inside the rescue - which aborts the rescue and cancels the
@@ -387,6 +428,9 @@
           {{ ("This role's sshd configuration was removed.")
              if (ssh_key_rotation_use_dropin | default(true) | bool)
              else ("This role's marked block was removed from sshd_config.") }}
+          {{ ('The crypto policy was put back to "' ~ (ssh_key_rotation_crypto_policy_record.before | default('?')) ~ '".')
+             if (ssh_key_rotation_crypto_policy_restored is defined and ssh_key_rotation_crypto_policy_restored is changed)
+             else '' }}
           {{ 'authorized_keys was restored to its pre-install contents, so the new key is no longer installed.'
              if (ssh_key_rotation_install_rb_ak is defined and ssh_key_rotation_install_rb_ak is changed)
              else 'authorized_keys was left as-is: no pre-install backup was recorded, or the old key could not be proven to work.' }}
