@@ -100,7 +100,7 @@ Other versions in the same families are likely to work, since nothing here relie
 ansible-galaxy collection install krameff.ssh_key_rotation
 
 # From a tarball or directory
-ansible-galaxy collection install /path/to/krameff-ssh_key_rotation-0.9.0.tar.gz
+ansible-galaxy collection install /path/to/krameff-ssh_key_rotation-0.9.2.tar.gz
 ```
 
 ## Usage

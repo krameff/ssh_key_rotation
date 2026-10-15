@@ -245,7 +245,7 @@ New variables should default to off or empty, so that upgrading never changes wh
 
 ```bash
 ansible-galaxy collection build .
-# Output: ./krameff-ssh_key_rotation-0.9.0.tar.gz
+# Output: ./krameff-ssh_key_rotation-0.9.2.tar.gz
 ```
 
 `galaxy.yml`'s `build_ignore` keeps the Molecule scenarios, CI configuration, editor and agent directories, and any local inventory or key material out of the tarball.
@@ -259,7 +259,7 @@ So the order is: bump `version` in `galaxy.yml`, move the `Unreleased` changelog
 To publish by hand if you need to:
 
 ```bash
-ansible-galaxy collection publish ./krameff-ssh_key_rotation-0.9.0.tar.gz \
+ansible-galaxy collection publish ./krameff-ssh_key_rotation-0.9.2.tar.gz \
   --api-key <your-api-key>
 ```
 
